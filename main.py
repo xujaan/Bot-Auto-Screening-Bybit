@@ -1,10 +1,12 @@
+import matplotlib
+matplotlib.use('Agg')
 import ccxt
 import time
 import schedule
 import random
 import os
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import numpy as np
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,7 +17,7 @@ from modules.quant import calculate_metrics, check_fakeout
 from modules.derivatives import analyze_derivatives
 from modules.smc import analyze_smc
 from modules.patterns import find_pattern
-from modules.discord_bot import send_alert, update_status_dashboard, run_fast_update, send_scan_completion
+from modules.bot import send_alert, update_status_dashboard, run_fast_update, send_scan_completion
 
 exchange = ccxt.bybit({'apiKey': CONFIG['api']['bybit_key'], 'secret': CONFIG['api']['bybit_secret'], 'options': {'defaultType': 'swap'}})
 
@@ -156,13 +158,38 @@ def scan():
         print(f"🔍 Scanning {len(syms)} valid pairs (Stables removed)...")
 
         for tf in reversed(CONFIG['system']['timeframes']):
+            scan_results = []
             with ThreadPoolExecutor(max_workers=CONFIG['system']['max_threads']) as ex:
                 futures = [ex.submit(analyze_ticker, s, tf, btc_bias, active_signals) for s in syms]
                 for f in as_completed(futures):
                     res = f.result()
-                    if res: 
-                        success = send_alert(res)
-                        if success: signal_count += 1
+                    if res: scan_results.append(res)
+            
+            # Sort by total score
+            for res in scan_results:
+                res['Total_Score'] = res.get('Tech_Score', 0) + res.get('SMC_Score', 0) + res.get('Quant_Score', 0) + res.get('Deriv_Score', 0)
+            scan_results.sort(key=lambda x: x['Total_Score'], reverse=True)
+            
+            from modules.database import get_risk_config
+            risk_cfg = get_risk_config()
+            active_pos_count = 0
+            if risk_cfg.get('auto_trade', False):
+                try:
+                    positions = exchange.fetch_positions()
+                    active_pos_count = len([p for p in positions if float(p['contracts']) > 0])
+                except Exception as e: print("Gagal fetch pos limit:", e)
+                
+            for res in scan_results:
+                success = send_alert(res)
+                if success: 
+                    signal_count += 1
+                    if risk_cfg.get('auto_trade', False):
+                        if active_pos_count < risk_cfg.get('max_concurrent_trades', 2):
+                            import modules.execution as execution
+                            if execution.execute_entry(exchange, res):
+                                active_pos_count += 1
+                        else:
+                            print(f"⏩ Melewati {res['Symbol']} (Kuota penuh: {active_pos_count}/{risk_cfg.get('max_concurrent_trades', 2)})")
                         
     except Exception as e: print(f"Scan Error: {e}")
     finally:
@@ -172,8 +199,13 @@ def scan():
 
 if __name__ == "__main__":
     init_db()
+    
+    from modules.telegram_listener import TelegramListener
+    tg_listener = TelegramListener()
+    tg_listener.start()
+    
     scan()
     schedule.every(CONFIG['system']['check_interval_hours']).hours.do(scan)
-    schedule.every(1).minutes.do(run_fast_update)
+    schedule.every(1).minutes.do(run_fast_update, exchange=exchange)
     print("🚀 Bot Started.")
     while True: schedule.run_pending(); time.sleep(1)

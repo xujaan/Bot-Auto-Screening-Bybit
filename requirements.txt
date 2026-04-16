@@ -1,6 +1,6 @@
 ccxt
 pandas
-pandas_ta
+pandas-ta-classic
 numpy
 schedule
 requests
@@ -8,3 +8,6 @@ mplfinance
 psycopg2-binary
 scipy
 python-dotenv
+streamlit
+plotly
+pytz

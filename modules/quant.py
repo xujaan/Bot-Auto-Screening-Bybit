@@ -1,5 +1,5 @@
 import numpy as np
-import pandas_ta as ta
+import pandas_ta_classic as ta
 from scipy.special import expit
 
 def calculate_z_score(series, window=20):

@@ -146,3 +146,36 @@ def get_conn():
 
 def release_conn(conn):
     if DB_POOL: DB_POOL.putconn(conn)
+
+def get_risk_config():
+    conn = get_conn()
+    defaults = {
+        'auto_trade': 'on',
+        'total_trading_capital_usdt': '10.0',
+        'max_concurrent_trades': '2',
+        'max_leverage_limit': '50'
+    }
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT key_name, value_text FROM bot_state WHERE key_name IN ('auto_trade', 'total_trading_capital_usdt', 'max_concurrent_trades', 'max_leverage_limit')")
+        rows = cur.fetchall()
+        for k, v in rows:
+            defaults[k] = v
+    except: pass
+    finally: release_conn(conn)
+    return {
+        'auto_trade': defaults.get('auto_trade', 'on') == 'on',
+        'total_trading_capital_usdt': float(defaults.get('total_trading_capital_usdt', 10)),
+        'max_concurrent_trades': int(defaults.get('max_concurrent_trades', 2)),
+        'max_leverage_limit': int(defaults.get('max_leverage_limit', 50))
+    }
+
+def set_risk_config(key, value):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES (%s, %s) ON CONFLICT (key_name) DO UPDATE SET value_text = EXCLUDED.value_text", (key, str(value)))
+        conn.commit()
+        return True
+    except: return False
+    finally: release_conn(conn)
