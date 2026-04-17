@@ -124,17 +124,22 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals):
         }
     except: return None
 
-def scan():
+def scan(progress_callback=None):
     start_time = time.time()
-    print(f"\n[{pd.Timestamp.now()}] 🔭 Scanning... Mode: {os.getenv('BOT_ENV', 'PROD')}")
+    msg = f"\n[{pd.Timestamp.now()}] 🔭 Scanning... Mode: {os.getenv('BOT_ENV', 'PROD')}"
+    print(msg)
     btc_bias = get_btc_bias()
     print(f"📊 BTC Bias: {btc_bias}")
     
+    if progress_callback:
+        progress_callback(f"🔍 **Mulai Scanning**\nBias BTC: `{btc_bias}`\nMengambil daftar market Bybit...")
+        
     active_signals = get_active_signals()
     print(f"🛡️ Active Signals Ignored: {len(active_signals)}")
     signal_count = 0 
     
     try:
+        if progress_callback: progress_callback(f"🔍 **Memfilter Koin**\nMenyingkirkan koin mati/stablecoin...")
         mkts = exchange.load_markets()
         
         # 🚫 LIST OF STABLECOINS TO IGNORE (As Base Currency)
@@ -155,9 +160,12 @@ def scan():
         
         random.shuffle(syms) 
         
-        print(f"🔍 Scanning {len(syms)} valid pairs (Stables removed)...")
+        c = len(syms)
+        print(f"🔍 Scanning {c} valid pairs (Stables removed)...")
 
-        for tf in reversed(CONFIG['system']['timeframes']):
+        tfs = CONFIG['system']['timeframes']
+        for i, tf in enumerate(reversed(tfs)):
+            if progress_callback: progress_callback(f"⏳ **Menganalisa Timeframe {tf}** ({i+1}/{len(tfs)})\nMemindai {c} koin secara paralel...")
             scan_results = []
             with ThreadPoolExecutor(max_workers=CONFIG['system']['max_threads']) as ex:
                 futures = [ex.submit(analyze_ticker, s, tf, btc_bias, active_signals) for s in syms]
@@ -191,11 +199,14 @@ def scan():
                         else:
                             print(f"⏩ Melewati {res['Symbol']} (Kuota penuh: {active_pos_count}/{risk_cfg.get('max_concurrent_trades', 2)})")
                         
-    except Exception as e: print(f"Scan Error: {e}")
+    except Exception as e: 
+        print(f"Scan Error: {e}")
+        if progress_callback: progress_callback(f"❌ **Error saat scanning:** \n`{str(e)}`")
     finally:
         duration = time.time() - start_time
         print(f"✅ Scan Finished in {duration:.2f}s. Signals: {signal_count}")
         send_scan_completion(signal_count, duration, btc_bias)
+        if progress_callback: progress_callback(f"✅ **Scanning Selesai dalam {duration:.1f} detik!**\nDitemukan **{signal_count}** sinyal valid dikirim.")
 
 if __name__ == "__main__":
     init_db()

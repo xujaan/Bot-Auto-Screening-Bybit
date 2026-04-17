@@ -20,6 +20,7 @@ class TelegramListener:
             commands = [
                 {"command": "status", "description": "Tampilkan PnL Live & tombol tutup posisi"},
                 {"command": "live", "description": "Lihat rekap trade dari Database"},
+                {"command": "pending", "description": "Lihat Limit Order yang sedang antre di Bybit"},
                 {"command": "scan", "description": "Paksa bot melakukan screening pasar saat ini juga"},
                 {"command": "reset", "description": "Hapus semua data riwayat screening di DB"},
                 {"command": "autotrade", "description": "ON/OFF fitur Auto Trade"},
@@ -213,7 +214,7 @@ class TelegramListener:
                     if hasattr(t_val, 'strftime'): return t_val.strftime('%H:%M')
                     if isinstance(t_val, str) and len(t_val) >= 16: return t_val[11:16]
                     return str(t_val)
-                lines = [f"`{fmt_time(t['entry_hit_at'] or t['created_at'])}` {'🟢' if 'Active' in t['status'] else '⏳'} **{t['symbol']}** ({t['side']}): {t['status']}" for t in trades]
+                lines = [f"`{fmt_time(t['entry_hit_at'] or t['created_at'])}` {'🟢' if 'Active' in t['status'] else '⏳'} **{t['symbol'].split(':')[0]}** ({t['side']}): {t['status']}" for t in trades]
             except Exception as e:
                 reply = f"❌ Error fetching DB live status: {e}"
             finally:
@@ -226,15 +227,51 @@ class TelegramListener:
                 reply = "<b>📊 LIVE DASHBOARD (DB)</b>\n\n⚪ Tidak ada trade aktif/pending di Database."
             
         elif cmd == '/scan':
-            reply = "🔍 **Memulai Scanning Pasar Manual...**\n\n*Bot sedang menyapu ratusan koin. Biarkan ia bekerja, jika ada sinyal profit, akan segera masuk ke sini!*"
             import threading
             def run_manual_scan():
                 import main
+                import requests
+                url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+                res = requests.post(url, json={'chat_id': chat_id, 'text': '⏳ Menyiapkan pemindai pasar...', 'parse_mode': 'Markdown'}).json()
+                msg_id = None
+                if res.get('ok'): msg_id = res['result']['message_id']
+                
+                def prog_cb(text):
+                    if msg_id:
+                        e_url = f"https://api.telegram.org/bot{self.token}/editMessageText"
+                        requests.post(e_url, json={'chat_id': chat_id, 'message_id': msg_id, 'text': text, 'parse_mode': 'Markdown'})
+                    
                 try:
-                    main.scan()
+                    main.scan(prog_cb)
                 except Exception as e:
-                    print(f"Manual scan error: {e}")
+                    prog_cb(f"❌ Error: {e}")
+                    
             threading.Thread(target=run_manual_scan, daemon=True).start()
+            return # reply handled locally
+            
+        elif cmd == '/pending':
+            if not self.exchange:
+                reply = "❌ Exchange is not initialized."
+            else:
+                try:
+                    open_orders = self.exchange.fetch_open_orders()
+                    if not open_orders:
+                        reply = "⚪ Tidak ada pending order di Bybit."
+                    else:
+                        reply = "⏳ **DAFTAR PENDING ORDER (BYBIT)** ⏳\n\n"
+                        for o in open_orders:
+                            sym = o['symbol'].split(':')[0]
+                            side = o['side'].upper()
+                            qty = o['amount']
+                            price = o['price']
+                            reply += f"⏱ **{sym}** ({side})\n"
+                            reply += f"   • Qty: `{qty}`\n"
+                            reply += f"   • Price: `{price}`\n\n"
+                            if len(reply) > 3500:
+                                reply += "...(Daftar kepanjangan, terpotong)..."
+                                break
+                except Exception as e:
+                    reply = f"❌ Gagal mengambil perintah pending: {e}"
             
         elif cmd == '/reset':
             keyboard = [[{"text": "⚠️ YA, HAPUS SEMUA DATA", "callback_data": "confirmreset_true"}]]
