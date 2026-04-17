@@ -207,7 +207,11 @@ class TelegramListener:
                 cur = get_dict_cursor(conn)
                 cur.execute("SELECT symbol, side, status, entry_hit_at, created_at FROM trades WHERE status NOT LIKE '%Closed%' ORDER BY created_at DESC")
                 trades = cur.fetchall()
-                lines = [f"`{(t['entry_hit_at'] or t['created_at']).strftime('%H:%M')}` {'🟢' if 'Active' in t['status'] else '⏳'} **{t['symbol']}** ({t['side']}): {t['status']}" for t in trades]
+                def fmt_time(t_val):
+                    if hasattr(t_val, 'strftime'): return t_val.strftime('%H:%M')
+                    if isinstance(t_val, str) and len(t_val) >= 16: return t_val[11:16]
+                    return str(t_val)
+                lines = [f"`{fmt_time(t['entry_hit_at'] or t['created_at'])}` {'🟢' if 'Active' in t['status'] else '⏳'} **{t['symbol']}** ({t['side']}): {t['status']}" for t in trades]
             except Exception as e:
                 reply = f"❌ Error fetching DB live status: {e}"
             finally:
