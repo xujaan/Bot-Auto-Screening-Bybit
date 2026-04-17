@@ -73,12 +73,32 @@ def send_telegram_alert(data, image_path=None):
     text += f"🧠 <b>Bias:</b> {data.get('BTC_Bias', '-')}"
     
     url = f"https://api.telegram.org/bot{token}/"
+    
+    reply_markup = None
+    try:
+        from modules.database import get_risk_config
+        cfg = get_risk_config()
+        if not cfg.get('auto_trade', False):
+            reply_markup = {
+                "inline_keyboard": [
+                    [{"text": f"⚡ Start Trade {data['Symbol']}", "callback_data": f"trade_{data['Symbol']}"}]
+                ]
+            }
+    except Exception as e:
+        print(f"Error fetching risk config for tg button: {e}")
+        
     try:
         if image_path and os.path.exists(image_path):
+            data_payload = {'chat_id': chat_id, 'caption': text, 'parse_mode': 'HTML'}
+            if reply_markup:
+                data_payload['reply_markup'] = json.dumps(reply_markup)
             with open(image_path, 'rb') as f:
-                requests.post(url + 'sendPhoto', data={'chat_id': chat_id, 'caption': text, 'parse_mode': 'HTML'}, files={'photo': f})
+                requests.post(url + 'sendPhoto', data=data_payload, files={'photo': f})
         else:
-            requests.post(url + 'sendMessage', json={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'})
+            json_payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+            if reply_markup:
+                json_payload['reply_markup'] = reply_markup
+            requests.post(url + 'sendMessage', json=json_payload)
         return True
     except Exception as e:
         print(f"Telegram Alert Error: {e}")

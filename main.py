@@ -201,7 +201,7 @@ if __name__ == "__main__":
     init_db()
     
     from modules.telegram_listener import TelegramListener
-    tg_listener = TelegramListener()
+    tg_listener = TelegramListener(exchange=exchange)
     tg_listener.start()
     
     scan()
