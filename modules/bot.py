@@ -317,7 +317,7 @@ def send_scan_completion(count, duration, bias):
 def run_fast_update(exchange=None):
     update_status_dashboard()
     
-    if exchange and CONFIG.get('risk_management', {}).get('auto_trade', False):
+    if exchange:
         try:
             import modules.execution as execution
             conn = get_conn()
