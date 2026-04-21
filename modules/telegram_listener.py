@@ -11,6 +11,7 @@ import requests
 import threading
 from modules.database import set_risk_config, get_risk_config, set_active_cex, get_active_cex
 from modules.config_loader import CONFIG
+import telegramify_markdown
 
 class TelegramListener:
     def __init__(self, exchange=None):
@@ -115,15 +116,15 @@ class TelegramListener:
                             if result:
                                 def fmt_price(p): return f"{p:.8f}".rstrip('0').rstrip('.') if p < 1 else f"{p:.4f}"
                                 reply = (
-                                    f"✅ <b>TRADE LIMIT SUCCESS!</b>\n\n"
-                                    f"🪙 <b>Symbol:</b> <code>{result['symbol']}</code>\n"
-                                    f"🧭 <b>Mode:</b> <code>{result['side']}</code>\n"
-                                    f"🎯 <b>Entry:</b> <code>{fmt_price(result['entry_price'])}</code>\n"
-                                    f"📦 <b>Quantity:</b> <code>{result['qty']}</code>\n"
-                                    f"🔩 <b>Leverage:</b> <code>{result['leverage']}x</code>\n"
-                                    f"💵 <b>Margin Used:</b> <code>${result['margin']:.2f}</code>\n"
-                                    f"🛑 <b>Stop Loss:</b> <code>{fmt_price(result['sl'])}</code>\n"
-                                    f"🛒 <b>Order ID:</b> <code>{result['order_id']}</code>"
+                                    f"✅ **TRADE LIMIT SUCCESS!**\n\n"
+                                    f"🪙 **Symbol:** `{result['symbol']}`\n"
+                                    f"🧭 **Mode:** `{result['side']}`\n"
+                                    f"🎯 **Entry:** `{fmt_price(result['entry_price'])}`\n"
+                                    f"📦 **Quantity:** `{result['qty']}`\n"
+                                    f"🔩 **Leverage:** `{result['leverage']}x`\n"
+                                    f"💵 **Margin Used:** `${result['margin']:.2f}`\n"
+                                    f"🛑 **Stop Loss:** `{fmt_price(result['sl'])}`\n"
+                                    f"🛒 **Order ID:** `{result['order_id']}`"
                                 )
                             else: reply = f"❌ Failed to place order for {symbol}."
                         else: reply = f"❌ Trade limit reached ({active_pos_count}/{risk_cfg.get('max_concurrent_trades', 2)})"
@@ -140,7 +141,7 @@ class TelegramListener:
                 from modules.database import get_conn, release_conn, get_dict_cursor, log_action
                 success, msg_response = close_position(self.exchange, symbol)
                 if success:
-                    reply = f"✅ <b>{msg_response}</b>"
+                    reply = f"✅ **{msg_response}**"
                     conn = get_conn()
                     try:
                         cur = get_dict_cursor(conn)
@@ -151,7 +152,7 @@ class TelegramListener:
                     finally: release_conn(conn)
                 else: 
                     log_action('MANUAL_CLOSE_ERROR', f"Failed to close {symbol}: {msg_response}")
-                    reply = f"❌ <b>{msg_response}</b>"
+                    reply = f"❌ **{msg_response}**"
                     
         elif data.startswith('fav_'):
             symbol = data[4:]
@@ -164,7 +165,7 @@ class TelegramListener:
                 if trade:
                     cur.execute("INSERT INTO favorites_list (symbol, side, timeframe, pattern, entry_price) VALUES (?, ?, ?, ?, ?)", (trade['symbol'], trade['side'], trade['timeframe'], trade['pattern'], trade['entry_price']))
                     conn.commit()
-                    reply = f"⭐ Pinned <b>{symbol}</b> ({trade['side']}) to your Favorites! Use /fav to view."
+                    reply = f"⭐ Pinned **{symbol}** ({trade['side']}) to your Favorites! Use /fav to view."
                 else: reply = f"❌ Cannot find recent screening for {symbol}."
             except Exception as e: reply = f"❌ DB Error: {e}"
             finally: release_conn(conn)
@@ -177,13 +178,13 @@ class TelegramListener:
                 cur.execute("DELETE FROM trades")
                 conn.commit()
                 log_action('SCREENING_RESET', 'User wiped the screening histories.')
-                reply = "✅ <b>SUCCESS!</b> Screening histories have been wiped from DB. Active Trades remain untouched."
+                reply = "✅ **SUCCESS!** Screening histories have been wiped from DB. Active Trades remain untouched."
             except Exception as e: reply = f"❌ Failed to wipe db: {e}"
             finally: release_conn(conn)
                     
         if reply and chat_id:
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            requests.post(url, json={'chat_id': chat_id, 'text': reply, 'parse_mode': 'HTML'})
+            requests.post(url, json={'chat_id': chat_id, 'text': telegramify_markdown.markdownify(reply), 'parse_mode': 'MarkdownV2'})
             
         ans_url = f"https://api.telegram.org/bot{self.token}/answerCallbackQuery"
         requests.post(ans_url, json={'callback_query_id': callback_id})
@@ -244,15 +245,15 @@ class TelegramListener:
                     if hasattr(t_val, 'strftime'): return t_val.strftime('%H:%M')
                     if isinstance(t_val, str) and len(t_val) >= 16: return t_val[11:16]
                     return str(t_val)
-                lines = [f"`{fmt_time(t['entry_hit_at'] or t['created_at'])}` {'🟢' if 'Active' in t['status'] else '⏳'} **{t['symbol'].split(':')[0]}** ({t['side']}): {t['status']}" for t in trades]
+                lines = [f"[{fmt_time(t['entry_hit_at'] or t['created_at'])}] {'🟢' if 'Active' in t['status'] else '⏳'} {t['symbol'].split(':')[0]} ({t['side']}): {t['status']}" for t in trades]
             except Exception as e: reply = f"❌ Error fetching DB: {e}"
             finally: release_conn(conn)
             
             if lines: 
                 block = "\n".join(lines)
-                reply = f"<b>📊 LIVE DASHBOARD (DB)</b>\n\n<pre>{block}</pre>"
+                reply = f"**📊 LIVE DASHBOARD (DB)**\n\n```text\n{block}\n```"
             elif not reply: 
-                reply = "<b>📊 LIVE DASHBOARD (DB)</b>\n\n<pre>⚪ No active or pending trades mapped.</pre>"
+                reply = "**📊 LIVE DASHBOARD (DB)**\n\n```text\n⚪ No active or pending trades mapped.\n```"
             
         elif cmd == '/scan':
             import threading
@@ -260,14 +261,14 @@ class TelegramListener:
                 import main
                 import requests
                 url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-                res = requests.post(url, json={'chat_id': chat_id, 'text': '⏳ Firing algorithm scan cycle...', 'parse_mode': 'Markdown'}).json()
+                res = requests.post(url, json={'chat_id': chat_id, 'text': telegramify_markdown.markdownify('⏳ Firing algorithm scan cycle...'), 'parse_mode': 'MarkdownV2'}).json()
                 msg_id = None
                 if res.get('ok'): msg_id = res['result']['message_id']
                 
                 def prog_cb(text):
                     if msg_id:
                         e_url = f"https://api.telegram.org/bot{self.token}/editMessageText"
-                        requests.post(e_url, json={'chat_id': chat_id, 'message_id': msg_id, 'text': text, 'parse_mode': 'Markdown'})
+                        requests.post(e_url, json={'chat_id': chat_id, 'message_id': msg_id, 'text': telegramify_markdown.markdownify(text), 'parse_mode': 'MarkdownV2'})
                 try: main.scan(prog_cb)
                 except Exception as e: prog_cb(f"❌ System Fault: {e}")
             threading.Thread(target=run_manual_scan, daemon=True).start()
@@ -291,14 +292,14 @@ class TelegramListener:
                             if len(block) > 3500:
                                 block += "...(Truncated)...\n"
                                 break
-                        reply = f"⏳ <b>BROKER QUEUE ({get_active_cex().title()})</b> ⏳\n\n<pre>{block}</pre>"
+                        reply = f"⏳ **BROKER QUEUE ({get_active_cex().title()})** ⏳\n\n```text\n{block}\n```"
                 except Exception as e: reply = f"❌ Fetch limits failed: {e}"
             
         elif cmd == '/reset':
             keyboard = [[{"text": "⚠️ PROCEED WIPE", "callback_data": "confirmreset_true"}]]
             import json
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            requests.post(url, json={'chat_id': chat_id, 'text': "⚠️ <b>WARNING:</b> This purely purges old screening histories.\n\nYour Active Auto Trades will <b>NOT</b> be erased.", 'parse_mode': 'HTML', 'reply_markup': json.dumps({"inline_keyboard": keyboard})})
+            requests.post(url, json={'chat_id': chat_id, 'text': telegramify_markdown.markdownify("⚠️ **WARNING:** This purely purges old screening histories.\n\nYour Active Auto Trades will **NOT** be erased."), 'parse_mode': 'MarkdownV2', 'reply_markup': json.dumps({"inline_keyboard": keyboard})})
             return
             
         elif cmd == '/balance':
@@ -311,10 +312,10 @@ class TelegramListener:
                     free = float(b['free'].get('USDT', 0))
                     used = float(b['used'].get('USDT', 0))
                     
-                    reply = f"🏦 <b>{active_cex} UNIFIED WALLET (USDT)</b> 🏦\n\n"
-                    reply += f"💵 <b>Total Equity:</b> <code>${total:.2f}</code>\n"
-                    reply += f"🛡️ <b>Margin Used:</b> <code>${used:.2f}</code>\n"
-                    reply += f"🟢 <b>Available:</b> <code>${free:.2f}</code>\n"
+                    reply = f"🏦 **{active_cex} UNIFIED WALLET (USDT)** 🏦\n\n"
+                    reply += f"💵 **Total Equity:** `${total:.2f}`\n"
+                    reply += f"🛡️ **Margin Used:** `${used:.2f}`\n"
+                    reply += f"🟢 **Available:** `${free:.2f}`\n"
                 except Exception as e: reply = f"❌ Fetch Balance failed: {e}"
                 
         elif cmd == '/log':
@@ -330,7 +331,7 @@ class TelegramListener:
                     for lg in logs:
                         dt = str(lg['created_at'])[11:19]
                         block += f"[{dt}] {lg['type']}\n > {lg['message']}\n"
-                    reply = f"📜 <b>SYSTEM LOGS (Last 10)</b>\n\n<pre>{block}</pre>"
+                    reply = f"📜 **SYSTEM LOGS (Last 10)**\n\n```text\n{block}\n```"
             except Exception as e: reply = f"❌ Fetch logs failed: {e}"
             finally: release_conn(conn)
             
@@ -347,7 +348,7 @@ class TelegramListener:
                     for f in favs:
                         block += f"⭐ {f['symbol']} ({f['side']})\n"
                         block += f" ├ TF: {f['timeframe']} [{f['pattern']}]\n └ Entry: {f['entry_price']}\n\n"
-                    reply = f"🌟 <b>SAVED FAVORITES</b> 🌟\n\n<pre>{block}</pre>"
+                    reply = f"🌟 **SAVED FAVORITES** 🌟\n\n```text\n{block}\n```"
             except Exception as e: reply = f"❌ Fetch favorites failed: {e}"
             finally: release_conn(conn)
             
@@ -359,7 +360,7 @@ class TelegramListener:
                     active_pos = [p for p in positions if float(p.get('contracts', 0)) > 0]
                     if not active_pos: reply = f"⚪ Zero exposure on {get_active_cex().title()}"
                     else:
-                        reply = f"🟢 <b>MARKET POSITIONS ({get_active_cex().title()})</b> 🟢\n\n"
+                        reply = f"🟢 **MARKET POSITIONS ({get_active_cex().title()})** 🟢\n\n"
                         keyboard = []
                         for p in active_pos:
                             sym = p['symbol']
@@ -375,17 +376,17 @@ class TelegramListener:
                                 pct = (pnl / margin_est * 100) if margin_est > 0 else 0
                                 
                             icon = "🟩" if pnl > 0 else "🟥"
-                            reply += f"{icon} <b>{sym}</b> (<code>{side}</code>)\n"
-                            reply += f"   • Margin: <code>{qty}</code>\n"
-                            reply += f"   • B. Entry: <code>{entry_price}</code>\n"
-                            reply += f"   • Est uNL: <code>${pnl:.2f} ({pct:.2f}%)</code>\n\n"
+                            reply += f"{icon} **{sym}** (`{side}`)\n"
+                            reply += f"   • Margin: `{qty}`\n"
+                            reply += f"   • B. Entry: `{entry_price}`\n"
+                            reply += f"   • Est uNL: `${pnl:.2f} ({pct:.2f}%)`\n\n"
                             keyboard.append([{"text": f"🛑 Kill {sym}", "callback_data": f"endtrade_{sym}"}])
                         import json
                         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-                        requests.post(url, json={'chat_id': chat_id, 'text': reply, 'parse_mode': 'Markdown', 'reply_markup': json.dumps({"inline_keyboard": keyboard})})
+                        requests.post(url, json={'chat_id': chat_id, 'text': telegramify_markdown.markdownify(reply), 'parse_mode': 'MarkdownV2', 'reply_markup': json.dumps({"inline_keyboard": keyboard})})
                         return 
                 except Exception as e: reply = f"❌ Socket link fault: {e}"
             
         if reply:
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            requests.post(url, json={'chat_id': chat_id, 'text': reply, 'parse_mode': 'HTML'})
+            requests.post(url, json={'chat_id': chat_id, 'text': telegramify_markdown.markdownify(reply), 'parse_mode': 'MarkdownV2'})

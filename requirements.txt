@@ -10,4 +10,4 @@ scipy
 python-dotenv
 streamlit
 plotly
-pytz
+pytztelegramify-markdown

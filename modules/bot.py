@@ -13,6 +13,10 @@ import mplfinance as mpf
 from scipy.signal import argrelextrema
 from datetime import datetime
 from modules.config_loader import CONFIG
+import telegramify_markdown
+from telegramify_markdown import customize
+customize.markdown_symbol.head_level_1 = "📌" 
+カスタマイズ: customize.strict_markdown = True # Wait, just using markdownify is fine.
 from modules.database import get_conn, release_conn, get_dict_cursor, get_active_cex
 
 def get_now(): return datetime.now(pytz.timezone(CONFIG['system']['timezone']))
@@ -83,27 +87,27 @@ def send_telegram_alert(data, image_path=None):
     if active_cex == 'BINANCE': cex_url = f"https://www.binance.com/en/futures/{sym_no_slash}"
     elif active_cex == 'BITGET': cex_url = f"https://www.bitget.com/futures/usdt/{sym_no_slash}"
     
-    text = f"<b>{emoji} SIGNAL: {data['Symbol']} </b>\n"
-    text += f"🏢 CEX: <b><a href='{cex_url}'>{active_cex}</a></b>\n"
-    text += f"🧭 <b>{data['Side']}</b> | <b>{data['Timeframe']}</b> | {data['Pattern']}\n"
-    text += f"🕒 <code>{ts}</code>\n\n"
-    text += f"💵 <b>Current:</b> <code>{format_price(current_price)}</code>\n"
-    text += f"🎯 <b>Entry:</b> <code>{format_price(data['Entry'])}</code>\n"
-    text += f"🛑 <b>Stop Loss:</b> <code>{format_price(data['SL'])}</code>\n"
-    text += f"💰 <b>Risk/Reward:</b> 1:{data.get('RR', 0.0)}\n\n"
-    text += f"🏁 <b>Targets:</b>\n"
-    text += f"TP1: <code>{format_price(data['TP1'])}</code>\n"
-    text += f"TP2: <code>{format_price(data['TP2'])}</code>\n"
-    text += f"TP3: <code>{format_price(data['TP3'])}</code>\n\n"
+    text = f"**{emoji} SIGNAL: {data['Symbol']}**\n"
+    text += f"🏢 CEX: **[{active_cex}]({cex_url})**\n"
+    text += f"🧭 **{data['Side']}** | **{data['Timeframe']}** | {data['Pattern']}\n"
+    text += f"🕒 `{ts}`\n\n"
+    text += f"💵 **Current:** `{format_price(current_price)}`\n"
+    text += f"🎯 **Entry:** `{format_price(data['Entry'])}`\n"
+    text += f"🛑 **Stop Loss:** `{format_price(data['SL'])}`\n"
+    text += f"💰 **Risk/Reward:** 1:{data.get('RR', 0.0)}\n\n"
+    text += f"🏁 **Targets:**\n"
+    text += f"TP1: `{format_price(data['TP1'])}`\n"
+    text += f"TP2: `{format_price(data['TP2'])}`\n"
+    text += f"TP3: `{format_price(data['TP3'])}`\n\n"
     
-    text += f"🧮 <b>Quant & Derivs:</b>\n"
-    text += f"• RVOL: <code>{rvol:.1f}x</code> ({rvol_txt})\n"
-    text += f"• Z-Score: <code>{data.get('Z_Score', 0):.2f}σ</code>\n"
-    text += f"• OBI: <code>{data.get('OBI', 0.0):.2f}</code>\n"
-    text += f"• Funding: <code>{fund_pct:.4f}%</code>\n\n"
+    text += f"🧮 **Quant & Derivs:**\n"
+    text += f"• RVOL: `{rvol:.1f}x` ({rvol_txt})\n"
+    text += f"• Z-Score: `{data.get('Z_Score', 0):.2f}σ`\n"
+    text += f"• OBI: `{data.get('OBI', 0.0):.2f}`\n"
+    text += f"• Funding: `{fund_pct:.4f}%`\n\n"
     
-    text += f"🏆 <b>Scores:</b>\nTech: <code>{data.get('Tech_Score',0)}</code> | SMC: <code>{data.get('SMC_Score',0)}</code> | Quant: <code>{data.get('Quant_Score',0)}</code> | Deriv: <code>{data.get('Deriv_Score',0)}</code>\n"
-    text += f"🧠 <b>BTC Bias:</b> {data.get('BTC_Bias', '-')}"
+    text += f"🏆 **Scores:**\nTech: `{data.get('Tech_Score',0)}` | SMC: `{data.get('SMC_Score',0)}` | Quant: `{data.get('Quant_Score',0)}` | Deriv: `{data.get('Deriv_Score',0)}`\n"
+    text += f"🧠 **BTC Bias:** {data.get('BTC_Bias', '-')}"
     
     url = f"https://api.telegram.org/bot{token}/"
     
@@ -124,12 +128,12 @@ def send_telegram_alert(data, image_path=None):
     msg_id = None
     try:
         if image_path and os.path.exists(image_path):
-            data_payload = {'chat_id': chat_id, 'caption': text, 'parse_mode': 'HTML'}
+            data_payload = {'chat_id': chat_id, 'caption': telegramify_markdown.markdownify(text), 'parse_mode': 'MarkdownV2'}
             if reply_markup: data_payload['reply_markup'] = json.dumps(reply_markup)
             with open(image_path, 'rb') as f:
                 r = requests.post(url + 'sendPhoto', data=data_payload, files={'photo': f})
         else:
-            json_payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+            json_payload = {'chat_id': chat_id, 'text': telegramify_markdown.markdownify(text), 'parse_mode': 'MarkdownV2'}
             if reply_markup: json_payload['reply_markup'] = reply_markup
             r = requests.post(url + 'sendMessage', json=json_payload)
             
@@ -145,7 +149,7 @@ def update_telegram_dashboard(lines_text):
     chat_id = CONFIG['api'].get('telegram_chat_id')
     if not token or not chat_id: return
     
-    content = "<b>📊 LIVE DASHBOARD</b>\n\n" + lines_text
+    content = "**📊 LIVE DASHBOARD**\n\n```text\n" + lines_text + "\n```"
     url = f"https://api.telegram.org/bot{token}/"
     
     conn = get_conn()
@@ -157,11 +161,11 @@ def update_telegram_dashboard(lines_text):
         
         success = False
         if msg_id:
-            r = requests.post(url + 'editMessageText', json={'chat_id': chat_id, 'message_id': msg_id, 'text': content, 'parse_mode': 'HTML'})
+            r = requests.post(url + 'editMessageText', json={'chat_id': chat_id, 'message_id': msg_id, 'text': telegramify_markdown.markdownify(content), 'parse_mode': 'MarkdownV2'})
             if r.status_code == 200: success = True
             
         if not success:
-            r = requests.post(url + 'sendMessage', json={'chat_id': chat_id, 'text': content, 'parse_mode': 'HTML'})
+            r = requests.post(url + 'sendMessage', json={'chat_id': chat_id, 'text': telegramify_markdown.markdownify(content), 'parse_mode': 'MarkdownV2'})
             if r.status_code == 200:
                 new_id = r.json().get('result', {}).get('message_id')
                 if new_id:
@@ -219,7 +223,7 @@ def update_status_dashboard():
             if hasattr(t_val, 'strftime'): return t_val.strftime('%H:%M')
             if isinstance(t_val, str) and len(t_val) >= 16: return t_val[11:16]
             return str(t_val)
-        lines = [f"`{fmt_time(t['entry_hit_at'] or t['created_at'])}` {'🟢' if 'Active' in t['status'] else '⏳'} **{t['symbol']}** ({t['side']}): {t['status']}" for t in trades]
+        lines = [f"[{fmt_time(t['entry_hit_at'] or t['created_at'])}] {'🟢' if 'Active' in t['status'] else '⏳'} {t['symbol']} ({t['side']}): {t['status']}" for t in trades]
     except Exception as e: pass
     finally: release_conn(conn)
     
@@ -232,9 +236,9 @@ def send_scan_completion(count, duration, bias):
     active_cex = get_active_cex().upper()
     if tg_token and tg_chat:
         icon = "🟢" if "Bullish" in bias else ("🔴" if "Bearish" in bias else "⚪")
-        text = f"🔭 <b>Scan Cycle Complete ({active_cex})</b>\n\n⏱️ <b>Duration:</b> <code>{duration:.2f}s</code>\n📶 <b>Signals Found:</b> <code>{count}</code>\n📊 <b>Global Bias:</b> {icon} <b>{bias}</b>"
+        text = f"🔭 **Scan Cycle Complete ({active_cex})**\n\n⏱️ **Duration:** `{duration:.2f}s`\n📶 **Signals Found:** `{count}`\n📊 **Global Bias:** {icon} **{bias}**"
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-        try: requests.post(url, json={'chat_id': tg_chat, 'text': text, 'parse_mode': 'HTML'})
+        try: requests.post(url, json={'chat_id': tg_chat, 'text': telegramify_markdown.markdownify(text), 'parse_mode': 'MarkdownV2'})
         except: pass
 
 def run_fast_update(exchange=None):
