@@ -27,10 +27,13 @@ class TelegramListener:
             url = f"https://api.telegram.org/bot{self.token}/setMyCommands"
             commands = [
                 {"command": "status", "description": "Show live positions & fast close actions"},
+                {"command": "balance", "description": "Check unified balance & exposure"},
                 {"command": "live", "description": "Show DB live dashboard & pending signals"},
                 {"command": "pending", "description": "Retrieve limit orders queue in Exchange"},
                 {"command": "scan", "description": "Force manual market scan instantly"},
-                {"command": "reset", "description": "Erase all old histories from database"},
+                {"command": "fav", "description": "View favorite saved signals"},
+                {"command": "log", "description": "View system activity logs"},
+                {"command": "reset", "description": "Erase screening histories from database"},
                 {"command": "autotrade", "description": "Toggle Autotrade ON/OFF"},
                 {"command": "setcapital", "description": "Set trading equity config"},
                 {"command": "setquota", "description": "Set maximum allowed open pairs"},
@@ -134,7 +137,7 @@ class TelegramListener:
                 reply = "❌ Exchange is not initialized."
             else:
                 from modules.execution import close_position
-                from modules.database import get_conn, release_conn, get_dict_cursor
+                from modules.database import get_conn, release_conn, get_dict_cursor, log_action
                 success, msg_response = close_position(self.exchange, symbol)
                 if success:
                     reply = f"✅ <b>{msg_response}</b>"
@@ -143,19 +146,38 @@ class TelegramListener:
                         cur = get_dict_cursor(conn)
                         cur.execute("UPDATE trades SET status = 'Closed (Manual)' WHERE symbol = ? AND status NOT LIKE '%Closed%'", (symbol,))
                         conn.commit()
+                        log_action('MANUAL_CLOSE', f"User manually closed position for {symbol}")
                     except: pass
                     finally: release_conn(conn)
-                else: reply = f"❌ {msg_response}"
+                else: 
+                    log_action('MANUAL_CLOSE_ERROR', f"Failed to close {symbol}: {msg_response}")
+                    reply = f"❌ <b>{msg_response}</b>"
+                    
+        elif data.startswith('fav_'):
+            symbol = data[4:]
+            from modules.database import get_conn, release_conn, get_dict_cursor
+            conn = get_conn()
+            try:
+                cur = get_dict_cursor(conn)
+                cur.execute("SELECT * FROM trades WHERE symbol = ? ORDER BY created_at DESC LIMIT 1", (symbol,))
+                trade = cur.fetchone()
+                if trade:
+                    cur.execute("INSERT INTO favorites_list (symbol, side, timeframe, pattern, entry_price) VALUES (?, ?, ?, ?, ?)", (trade['symbol'], trade['side'], trade['timeframe'], trade['pattern'], trade['entry_price']))
+                    conn.commit()
+                    reply = f"⭐ Pinned <b>{symbol}</b> ({trade['side']}) to your Favorites! Use /fav to view."
+                else: reply = f"❌ Cannot find recent screening for {symbol}."
+            except Exception as e: reply = f"❌ DB Error: {e}"
+            finally: release_conn(conn)
                     
         elif data == 'confirmreset_true':
-            from modules.database import get_conn, release_conn
+            from modules.database import get_conn, release_conn, log_action
             conn = get_conn()
             try:
                 cur = conn.cursor()
                 cur.execute("DELETE FROM trades")
-                cur.execute("DELETE FROM active_trades")
                 conn.commit()
-                reply = "✅ **SUCCESS!** Entire history pipeline has been completely wiped from SQLite DB."
+                log_action('SCREENING_RESET', 'User wiped the screening histories.')
+                reply = "✅ <b>SUCCESS!</b> Screening histories have been wiped from DB. Active Trades remain untouched."
             except Exception as e: reply = f"❌ Failed to wipe db: {e}"
             finally: release_conn(conn)
                     
@@ -276,8 +298,58 @@ class TelegramListener:
             keyboard = [[{"text": "⚠️ PROCEED WIPE", "callback_data": "confirmreset_true"}]]
             import json
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            requests.post(url, json={'chat_id': chat_id, 'text': "⚠️ **CRITICAL WARNING:** This completely purges screening arrays and position DB histories.\n\n*Action is irreversible.*", 'parse_mode': 'Markdown', 'reply_markup': json.dumps({"inline_keyboard": keyboard})})
+            requests.post(url, json={'chat_id': chat_id, 'text': "⚠️ <b>WARNING:</b> This purely purges old screening histories.\n\nYour Active Auto Trades will <b>NOT</b> be erased.", 'parse_mode': 'HTML', 'reply_markup': json.dumps({"inline_keyboard": keyboard})})
             return
+            
+        elif cmd == '/balance':
+            if not self.exchange: reply = "❌ Exchange engine disjointed."
+            else:
+                try:
+                    active_cex = get_active_cex().title()
+                    b = self.exchange.fetch_balance()
+                    total = float(b['total'].get('USDT', 0))
+                    free = float(b['free'].get('USDT', 0))
+                    used = float(b['used'].get('USDT', 0))
+                    
+                    reply = f"🏦 <b>{active_cex} UNIFIED WALLET (USDT)</b> 🏦\n\n"
+                    reply += f"💵 <b>Total Equity:</b> <code>${total:.2f}</code>\n"
+                    reply += f"🛡️ <b>Margin Used:</b> <code>${used:.2f}</code>\n"
+                    reply += f"🟢 <b>Available:</b> <code>${free:.2f}</code>\n"
+                except Exception as e: reply = f"❌ Fetch Balance failed: {e}"
+                
+        elif cmd == '/log':
+            from modules.database import get_conn, release_conn, get_dict_cursor
+            conn = get_conn()
+            try:
+                cur = get_dict_cursor(conn)
+                cur.execute("SELECT type, message, created_at FROM system_logs ORDER BY created_at DESC LIMIT 10")
+                logs = cur.fetchall()
+                if not logs: reply = "⚪ No system logs mapped yet."
+                else:
+                    block = ""
+                    for lg in logs:
+                        dt = str(lg['created_at'])[11:19]
+                        block += f"[{dt}] {lg['type']}\n > {lg['message']}\n"
+                    reply = f"📜 <b>SYSTEM LOGS (Last 10)</b>\n\n<pre>{block}</pre>"
+            except Exception as e: reply = f"❌ Fetch logs failed: {e}"
+            finally: release_conn(conn)
+            
+        elif cmd == '/fav':
+            from modules.database import get_conn, release_conn, get_dict_cursor
+            conn = get_conn()
+            try:
+                cur = get_dict_cursor(conn)
+                cur.execute("SELECT symbol, side, timeframe, pattern, entry_price FROM favorites_list ORDER BY added_at DESC LIMIT 15")
+                favs = cur.fetchall()
+                if not favs: reply = "⚪ You have no favorites saved."
+                else:
+                    block = ""
+                    for f in favs:
+                        block += f"⭐ {f['symbol']} ({f['side']})\n"
+                        block += f" ├ TF: {f['timeframe']} [{f['pattern']}]\n └ Entry: {f['entry_price']}\n\n"
+                    reply = f"🌟 <b>SAVED FAVORITES</b> 🌟\n\n<pre>{block}</pre>"
+            except Exception as e: reply = f"❌ Fetch favorites failed: {e}"
+            finally: release_conn(conn)
             
         elif cmd == '/status':
             if not self.exchange: reply = "❌ Exchange engine disjointed."

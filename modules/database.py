@@ -149,6 +149,8 @@ def migrate_schema(conn):
                 print("✅ Schema is up to date.")
 
         cur.execute("CREATE TABLE IF NOT EXISTS bot_state (key_name VARCHAR(50) PRIMARY KEY, value_text TEXT);")
+        cur.execute("CREATE TABLE IF NOT EXISTS system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, type VARCHAR(50), message TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
+        cur.execute("CREATE TABLE IF NOT EXISTS favorites_list (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol VARCHAR(50), side VARCHAR(20), timeframe VARCHAR(10), pattern VARCHAR(50), entry_price DECIMAL, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
         conn.commit()
 
         # Check default active_cex
@@ -240,4 +242,15 @@ def set_active_cex(platform_name):
         print("Error saving active CEX:", e)
         return False
     finally: 
+        release_conn(conn)
+
+def log_action(log_type, message):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO system_logs (type, message) VALUES (?, ?)", (str(log_type), str(message)))
+        conn.commit()
+    except Exception as e:
+        print(f"Failed to write log: {e}")
+    finally:
         release_conn(conn)

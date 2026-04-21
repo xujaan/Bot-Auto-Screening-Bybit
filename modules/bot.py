@@ -78,8 +78,13 @@ def send_telegram_alert(data, image_path=None):
     if "Order Block" in smc_reasons_str: smc_txt = "Bullish Demand" if "Bullish" in smc_reasons_str else "Bearish Supply"
     elif data.get('SMC_Score', 0) > 0: smc_txt = "Confluence Found"
     
+    sym_no_slash = data['Symbol'].replace('/', '').replace(':', '')
+    cex_url = f"https://www.bybit.com/trade/usdt/{sym_no_slash}"
+    if active_cex == 'BINANCE': cex_url = f"https://www.binance.com/en/futures/{sym_no_slash}"
+    elif active_cex == 'BITGET': cex_url = f"https://www.bitget.com/futures/usdt/{sym_no_slash}"
+    
     text = f"<b>{emoji} SIGNAL: {data['Symbol']} </b>\n"
-    text += f"🏢 CEX: <b>{active_cex}</b>\n"
+    text += f"🏢 CEX: <b><a href='{cex_url}'>{active_cex}</a></b>\n"
     text += f"🧭 <b>{data['Side']}</b> | <b>{data['Timeframe']}</b> | {data['Pattern']}\n"
     text += f"🕒 <code>{ts}</code>\n\n"
     text += f"💵 <b>Current:</b> <code>{format_price(current_price)}</code>\n"
@@ -106,12 +111,14 @@ def send_telegram_alert(data, image_path=None):
     try:
         from modules.database import get_risk_config
         cfg = get_risk_config()
+        
+        reply_markup = {"inline_keyboard": []}
+        btn_row = []
         if not cfg.get('auto_trade', False):
-            reply_markup = {
-                "inline_keyboard": [
-                    [{"text": f"⚡ Start Trade {data['Symbol']}", "callback_data": f"trade_{data['Symbol']}"}]
-                ]
-            }
+            btn_row.append({"text": f"⚡ Start Trade", "callback_data": f"trade_{data['Symbol']}"})
+        
+        btn_row.append({"text": f"⭐ Favorite", "callback_data": f"fav_{data['Symbol']}"})
+        reply_markup["inline_keyboard"].append(btn_row)
     except: pass
         
     msg_id = None
