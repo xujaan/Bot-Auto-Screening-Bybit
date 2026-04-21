@@ -12,3 +12,4 @@ streamlit
 plotly
 pytz
 telegramify-markdown
+pyTelegramBotAPI

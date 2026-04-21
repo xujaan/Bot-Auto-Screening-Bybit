@@ -14,9 +14,6 @@ from scipy.signal import argrelextrema
 from datetime import datetime
 from modules.config_loader import CONFIG
 import telegramify_markdown
-from telegramify_markdown import customize
-customize.markdown_symbol.head_level_1 = "📌" 
-カスタマイズ: customize.strict_markdown = True # Wait, just using markdownify is fine.
 from modules.database import get_conn, release_conn, get_dict_cursor, get_active_cex
 
 def get_now(): return datetime.now(pytz.timezone(CONFIG['system']['timezone']))
