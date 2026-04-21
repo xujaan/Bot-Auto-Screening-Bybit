@@ -1,47 +1,77 @@
+"""
+Tujuan: Mengotomatisasi siklus hidup trading (Entry, Limit TPs, SL to Breakeven, Close) untuk koin-koin yang disaring.
+Caller: Standalone script (Background Worker).
+Dependensi: ccxt, pybit, sqlite3, schedule.
+Main Functions: ingest_fresh_signals(), check_pending_orders(), poll_positions(), check_missed_tps()
+Side Effects: Write/Read dari SQLite. Eksekusi orders ke bursa (Binance/Bitget/Bybit).
+"""
+
 import ccxt
 import time
 import schedule
 import threading
 import logging
+import math
 from datetime import datetime
 from pybit.unified_trading import WebSocket
 from modules.config_loader import CONFIG
-from modules.database import get_conn, release_conn
+from modules.database import get_conn, release_conn, get_active_cex
+from modules.exchange_manager import get_current_exchange
 
-# --- ⚙️ CONFIGURATION ---
 TARGET_LEVERAGE = 25    
-RISK_PERCENT = 0.01           # Risk 1% of Equity per trade
-MAX_POSITIONS = 40            # Max Concurrent OPEN positions
-TP_SPLIT = [0.30, 0.30, 0.40] # 30% TP1, 30% TP2, 40% TP3
+RISK_PERCENT = 0.01           
+MAX_POSITIONS = 40            
+TP_SPLIT = [0.30, 0.30, 0.40] 
 
-# Logging Setup
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("AutoTrader")
 
-# REST API Connection (CCXT)
-exchange = ccxt.bybit({
-    'apiKey': CONFIG['api']['bybit_key'],
-    'secret': CONFIG['api']['bybit_secret'],
-    'options': {'defaultType': 'swap', 'adjustForTimeDifference': True}
-})
+# Globals to hold active connection states
+active_engine = {
+    'platform': None,
+    'exchange': None,
+    'ws': None
+}
 
-# ---------------------------------------------------------
-# 🛠️ DATABASE INITIALIZATION (Self-Healing)
-# ---------------------------------------------------------
+def sync_active_exchange():
+    """Reloads CEX instance safely if switched dynamically in DB."""
+    current_cex = get_active_cex()
+    
+    if active_engine['platform'] != current_cex:
+        logger.info(f"🔄 CEX Switch Detected! Loading {current_cex.upper()}")
+        active_engine['platform'] = current_cex
+        active_engine['exchange'] = get_current_exchange(force_reload=True)
+        
+        # Close old WS if it exists
+        if active_engine['ws']:
+            try: active_engine['ws'].close()
+            except: pass
+            active_engine['ws'] = None
+            
+        # If bybit, init optimized WebSocket
+        if current_cex == 'bybit':
+            try:
+                keys = CONFIG['api'].get('bybit', {})
+                ws = WebSocket(
+                    testnet=False,
+                    channel_type="private",
+                    api_key=keys.get('key', ''),
+                    api_secret=keys.get('secret', ''),
+                )
+                ws.execution_stream(callback=on_execution_update)
+                ws.position_stream(callback=on_position_update)
+                active_engine['ws'] = ws
+                logger.info("🔌 Bybit WebSocket Connected.")
+            except Exception as e:
+                logger.error(f"Failed to connect Bybit WS: {e}")
+                
 def init_execution_db():
-    """Creates execution tables if they don't exist."""
     conn = get_conn()
     try:
         cur = conn.cursor()
-        
-        # 1. Active Trades Table (Isolated Execution)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS active_trades (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 signal_id INT,
                 symbol VARCHAR(20),
                 side VARCHAR(10),
@@ -56,12 +86,12 @@ def init_execution_db():
                 status VARCHAR(20) DEFAULT 'PENDING',
                 pnl DECIMAL DEFAULT 0,
                 is_sl_moved BOOLEAN DEFAULT FALSE,
+                trailing_active BOOLEAN DEFAULT FALSE,
+                trailing_stop_price DECIMAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-
-        # 2. Daily Reports Table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_reports (
                 report_date DATE PRIMARY KEY,
@@ -78,199 +108,210 @@ def init_execution_db():
             );
         """)
         conn.commit()
-        logger.info("✅ Execution Database Tables Sync Complete.")
+        logger.info("✅ Execution DB Synced.")
     except Exception as e:
         logger.error(f"❌ DB Init Error: {e}")
     finally:
         release_conn(conn)
 
-# ---------------------------------------------------------
-# ⚡ WEBSOCKET EVENT HANDLERS (Real-Time Brain)
-# ---------------------------------------------------------
 def place_split_tps(symbol, side, total_qty, tp1, tp2, tp3):
-    """
-    Called instantly via WebSocket when Entry is Filled.
-    Places 3 Reduce-Only Limit orders.
-    """
     try:
-        # 1. NORMALIZE SIDE (Fixes the 110017 Error)
-        # Entry could be 'Buy', 'Long', 'Sell', or 'Short'
         side_str = str(side).lower()
+        tp_side = 'sell' if side_str in ['buy', 'long'] else 'buy'
         
-        # If Entry was Buy/Long -> We must SELL to close
-        if side_str in ['buy', 'long']:
-            tp_side = 'sell'
-        # If Entry was Sell/Short -> We must BUY to close
-        else:
-            tp_side = 'buy'
+        exchange = active_engine['exchange']
+        if not exchange: return False
         
-        # 2. Calculate Splits
         q1 = float(exchange.amount_to_precision(symbol, total_qty * TP_SPLIT[0]))
         q2 = float(exchange.amount_to_precision(symbol, total_qty * TP_SPLIT[1]))
-        q3 = float(exchange.amount_to_precision(symbol, total_qty * TP_SPLIT[2]))
         
-        # Adjust remainder to ensure 100% close
-        current_sum = q1 + q2 + q3
-        if current_sum != total_qty:
-            diff = total_qty - current_sum
-            q3 += diff
-            q3 = float(exchange.amount_to_precision(symbol, q3))
-
+        # We NO LONGER limit TP3! We let it trail!
         params = {'reduceOnly': True}
         
-        logger.info(f"⚡ Placing TPs for {symbol} ({tp_side.upper()}): {q1} | {q2} | {q3}")
+        logger.info(f"⚡ Placing TPs for {symbol} ({tp_side.upper()}): {q1} | {q2} | Trailing 40%")
         
-        # Place Orders
         exchange.create_order(symbol, 'limit', tp_side, q1, float(tp1), params)
         exchange.create_order(symbol, 'limit', tp_side, q2, float(tp2), params)
-        exchange.create_order(symbol, 'limit', tp_side, q3, float(tp3), params)
         
         return True
     except Exception as e:
-        logger.error(f"⚠️ TP Placement Failed {symbol}: {e}")
+        logger.error(f"⚠️ TP Fail {symbol}: {e}")
         return False
 
+# --- BYBIT WEBSOCKET HANDLERS ---
 def on_execution_update(message):
-    """
-    WebSocket Callback: Listens for Order Fills ('Trade').
-    Triggers TP placement logic immediately.
-    """
     try:
         data = message.get('data', [])
         for exec_item in data:
-            symbol = exec_item['symbol']
-            side = exec_item['side']
-            exec_type = exec_item.get('execType') 
-            
-            # Filter: Only care about 'Trade' (Fills)
-            if exec_type == 'Trade':
+            if exec_item.get('execType') == 'Trade':
                 conn = get_conn()
                 try:
                     cur = conn.cursor()
-                    
-                    # Check if we have an OPEN trade waiting for TPs
-                    cur.execute("""
-                        SELECT id, tp1, tp2, tp3 
-                        FROM active_trades 
-                        WHERE symbol = %s AND status = 'OPEN'
-                    """, (symbol,))
+                    cur.execute("SELECT id, tp1, tp2, tp3 FROM active_trades WHERE symbol = ? AND status = 'OPEN'", (exec_item['symbol'],))
                     row = cur.fetchone()
-                    
                     if row:
                         t_id, tp1, tp2, tp3 = row
-                        logger.info(f"⚡ WS: Entry Filled for {symbol}! Placing TPs...")
-                        
-                        # Double check position size from REST to be accurate
-                        pos = exchange.fetch_position(symbol)
-                        current_size = float(pos['contracts'])
-                        
-                        if current_size > 0:
-                            success = place_split_tps(symbol, side, current_size, tp1, tp2, tp3)
-                            if success:
-                                cur.execute("UPDATE active_trades SET status = 'OPEN_TPS_SET', updated_at = NOW() WHERE id = %s", (t_id,))
+                        pos = active_engine['exchange'].fetch_position(exec_item['symbol'])
+                        size = float(pos['contracts'])
+                        if size > 0:
+                            if place_split_tps(exec_item['symbol'], exec_item['side'], size, tp1, tp2, tp3):
+                                cur.execute("UPDATE active_trades SET status = 'OPEN_TPS_SET', updated_at = datetime('now') WHERE id = ?", (t_id,))
                                 conn.commit()
-                except Exception as e:
-                    logger.error(f"WS Exec Logic Error: {e}")
-                finally:
-                    release_conn(conn)
-    except Exception as e:
-        logger.error(f"WS Payload Error: {e}")
+                except: pass
+                finally: release_conn(conn)
+    except: pass
 
 def on_position_update(message):
-    """
-    WebSocket Callback: Listens for PnL/Price updates.
-    Handles BEP moves and Close detection.
-    """
     try:
         data = message.get('data', [])
         for pos in data:
             symbol = pos['symbol']
             size = float(pos['size'])
             mark_price = float(pos['markPrice'])
-            side = pos['side'] # 'Buy' or 'Sell'
+            side = pos['side']
             
             conn = get_conn()
             try:
                 cur = conn.cursor()
-                
-                # Fetch trade info
-                cur.execute("""
-                    SELECT id, entry_price, tp1, is_sl_moved, status 
-                    FROM active_trades 
-                    WHERE symbol = %s AND status = 'OPEN_TPS_SET'
-                """, (symbol,))
+                cur.execute("SELECT id, entry_price, tp1, is_sl_moved, status FROM active_trades WHERE symbol = ? AND status = 'OPEN_TPS_SET'", (symbol,))
                 row = cur.fetchone()
                 
                 if row:
                     t_id, entry, tp1, sl_moved, status = row
                     
-                    # 1. POSITION CLOSED CHECK (Size -> 0)
                     if size == 0:
-                        logger.info(f"🏁 WS: {symbol} Position Closed. Fetching PnL...")
-                        time.sleep(1) # Allow Bybit backend to settle PnL
+                        logger.info(f"🏁 {symbol} Pos Closed (WS).")
+                        time.sleep(1)
                         try:
-                            trades = exchange.fetch_my_trades(symbol, limit=1)
+                            trades = active_engine['exchange'].fetch_my_trades(symbol, limit=1)
                             real_pnl = float(trades[0]['info'].get('closedPnl', 0)) if trades else 0
-                            cur.execute("UPDATE active_trades SET status = 'CLOSED', pnl = %s, updated_at = NOW() WHERE id = %s", (real_pnl, t_id))
+                            cur.execute("UPDATE active_trades SET status = 'CLOSED', pnl = ?, updated_at = datetime('now') WHERE id = ?", (real_pnl, t_id))
                         except:
-                            cur.execute("UPDATE active_trades SET status = 'CLOSED', updated_at = NOW() WHERE id = %s", (t_id,))
+                            cur.execute("UPDATE active_trades SET status = 'CLOSED', updated_at = datetime('now') WHERE id = ?", (t_id,))
                         conn.commit()
                         return
 
-                    # 2. BREAKEVEN LOGIC (Hit TP1 -> Move SL)
-                    # For Long: Mark >= TP1. For Short: Mark <= TP1
-                    hit_tp1 = (side == 'Buy' and mark_price >= float(tp1)) or \
-                              (side == 'Sell' and mark_price <= float(tp1))
-                    
+                    hit_tp1 = (side == 'Buy' and mark_price >= float(tp1)) or (side == 'Sell' and mark_price <= float(tp1))
                     if hit_tp1 and not sl_moved:
-                        logger.info(f"♻️ WS: {symbol} hit TP1. Moving SL to Entry...")
+                        logger.info(f"♻️ {symbol} TP1 Hit. BEP...")
                         try:
-                            exchange.set_position_stop_loss(symbol, float(entry), side.lower())
-                            cur.execute("UPDATE active_trades SET is_sl_moved = TRUE WHERE id = %s", (t_id,))
+                            active_engine['exchange'].set_position_stop_loss(symbol, float(entry), side.lower())
+                            cur.execute("UPDATE active_trades SET is_sl_moved = 1 WHERE id = ?", (t_id,))
                             conn.commit()
-                        except Exception as sl_err:
-                            logger.error(f"⚠️ Failed to move SL for {symbol}: {sl_err}")
-
-            except Exception as e:
-                # logger.error(f"WS Pos Error: {e}") # Silent fail on DB locks
-                pass
-            finally:
-                release_conn(conn)
+                        except: pass
+            except: pass
+            finally: release_conn(conn)
     except: pass
 
-# ---------------------------------------------------------
-# 📥 SIGNAL INGESTION (Loop)
-# ---------------------------------------------------------
-def ingest_fresh_signals():
-    """Reads 'Waiting Entry' from scanner table, applies Risk/Lev, inserts to active_trades."""
+
+# --- CCXT POLLING ENGINE (For Binance/Bitget) ---
+def ccxt_poll_positions():
+    """Fallback Poller for CEXs that don't have WebSocket implemented here."""
+    exchange = active_engine['exchange']
+    if not exchange or active_engine['platform'] == 'bybit': return # Bybit uses WS
+    
     conn = get_conn()
     try:
         cur = conn.cursor()
         
-        # 1. Check Max Positions (OPEN only)
+        # 1. Manage Entries waiting for TPs ('OPEN')
+        cur.execute("SELECT id, symbol, side, tp1, tp2, tp3 FROM active_trades WHERE status = 'OPEN'")
+        open_trades = cur.fetchall()
+        for t in open_trades:
+            t_id, sym, side_str, tp1, tp2, tp3 = t
+            try:
+                pos = exchange.fetch_position(sym)
+                size = float(pos.get('contracts', 0))
+                if size > 0:
+                    if place_split_tps(sym, side_str, size, tp1, tp2, tp3):
+                        cur.execute("UPDATE active_trades SET status = 'OPEN_TPS_SET', updated_at = datetime('now') WHERE id = ?", (t_id,))
+            except Exception as e:
+                logger.error(f"Poll Entry Error {sym}: {e}")
+                
+        # 2. Manage 'OPEN_TPS_SET' for PnL, SL move, and Trailing Stop
+        cur.execute("SELECT t.id, t.symbol, t.side, t.entry_price, t.tp1, t.tp2, t.is_sl_moved, t.trailing_active, t.trailing_stop_price, s.natr FROM active_trades t LEFT JOIN trades s ON t.signal_id = s.id WHERE t.status = 'OPEN_TPS_SET'")
+        active_tps = cur.fetchall()
+        for t in active_tps:
+            t_id, sym, side_str, entry, tp1, tp2, sl_moved, trail_active, trail_stop, natr_val = t
+            try:
+                pos = exchange.fetch_position(sym)
+                size = float(pos.get('contracts', 0))
+                
+                # Check Closure
+                if size <= 0:
+                    try:
+                        trades = exchange.fetch_my_trades(sym, limit=1)
+                        pnl = sum([float(tr['info'].get('realizedPnl', 0)) for tr in trades])
+                    except: pnl = 0
+                    cur.execute("UPDATE active_trades SET status = 'CLOSED', pnl = ?, updated_at = datetime('now') WHERE id = ?", (pnl, t_id))
+                    logger.info(f"🏁 {sym} Pos Closed (Poll).")
+                    continue
+                
+                mark = float(pos.get('markPrice', 0))
+                
+                # Check BEP Move (TP1 Hit)
+                hit_tp1 = (side_str == 'Long' and mark >= float(tp1)) or (side_str == 'Short' and mark <= float(tp1))
+                if hit_tp1 and not sl_moved:
+                    logger.info(f"♻️ {sym} TP1 Hit. Modifying SL to Break Even...")
+                    try:
+                        exchange.create_order(sym, 'stopMarket', 'sell' if side_str == 'Long' else 'buy', size, params={'stopPrice': float(entry), 'reduceOnly': True})
+                        cur.execute("UPDATE active_trades SET is_sl_moved = 1 WHERE id = ?", (t_id,))
+                    except: pass 
+                    
+                # Check Trailing Activation (TP2 Hit)
+                hit_tp2 = (side_str == 'Long' and mark >= float(tp2)) or (side_str == 'Short' and mark <= float(tp2))
+                if hit_tp2 and not trail_active:
+                    logger.info(f"🚀 {sym} TP2 Hit! Activating Chandelier Trailing Stop...")
+                    cur.execute("UPDATE active_trades SET trailing_active = 1, trailing_stop_price = ? WHERE id = ?", (float(entry), t_id))
+                    trail_active = True
+                    trail_stop = float(entry)
+                    
+                # Trailing Logic Execution
+                if trail_active:
+                    atr_buffer = float(natr_val if natr_val else (mark * 0.02)) * 2 # 2x ATR buffer or 4% default
+                    if side_str == 'Long':
+                        new_trail = mark - atr_buffer
+                        if not trail_stop or new_trail > float(trail_stop):
+                            cur.execute("UPDATE active_trades SET trailing_stop_price = ? WHERE id = ?", (new_trail, t_id))
+                            try: exchange.create_order(sym, 'stopMarket', 'sell', size, params={'stopPrice': new_trail, 'reduceOnly': True})
+                            except: pass
+                    else:
+                        new_trail = mark + atr_buffer
+                        if not trail_stop or new_trail < float(trail_stop):
+                            cur.execute("UPDATE active_trades SET trailing_stop_price = ? WHERE id = ?", (new_trail, t_id))
+                            try: exchange.create_order(sym, 'stopMarket', 'buy', size, params={'stopPrice': new_trail, 'reduceOnly': True})
+                            except: pass
+            except: pass
+            
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Poller Error: {e}")
+    finally:
+        release_conn(conn)
+
+
+# --- GENERAL LOGIC ---
+def ingest_fresh_signals():
+    exchange = active_engine['exchange']
+    if not exchange: return
+    
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM active_trades WHERE status IN ('OPEN', 'OPEN_TPS_SET')")
         current_active = cur.fetchone()[0]
-        
-        if current_active >= MAX_POSITIONS:
-            # logger.info(f"🚫 Max positions ({current_active}) reached.")
-            return
+        if current_active >= MAX_POSITIONS: return
 
-        # 2. Fetch Data needed for calc
-        try:
-            balance = exchange.fetch_balance()
-            total_equity = float(balance['total']['USDT'])
-            markets = exchange.load_markets()
-        except Exception as e:
-            logger.error(f"API Fetch Error: {e}")
-            return
+        balance = exchange.fetch_balance()
+        total_equity = float(balance['total']['USDT'])
+        markets = exchange.load_markets()
 
-        # 3. Get New Signals
         query = """
-            SELECT t.id, t.symbol, t.side, t.entry_price, t.sl_price, t.tp1, t.tp2, t.tp3
+            SELECT t.id, t.symbol, t.side, t.entry_price, t.sl_price, t.tp1, t.tp2, t.tp3, t.natr
             FROM trades t
             LEFT JOIN active_trades a ON t.id = a.signal_id
             WHERE t.status = 'Waiting Entry'
-            AND t.created_at >= NOW() - INTERVAL '12 hours'
+            AND t.created_at >= datetime('now', '-12 hours')
             AND a.id IS NULL
         """
         cur.execute(query)
@@ -278,268 +319,129 @@ def ingest_fresh_signals():
         
         for sig in signals:
             if current_active >= MAX_POSITIONS: break
-            
-            sig_id, sym, side, entry, sl, tp1, tp2, tp3 = sig
+            sig_id, sym, side, entry, sl, tp1, tp2, tp3, natr = sig
             entry, sl = float(entry), float(sl)
             
-            # A. Dynamic Leverage (Target 25x or Max)
             market = markets.get(sym)
             max_lev = 25
-            if market and 'limits' in market:
-                limit_lev = market['limits']['leverage']['max']
-                if limit_lev: max_lev = float(limit_lev)
+            if market and 'limits' in market and 'leverage' in market['limits']:
+                try: max_lev = float(market['limits']['leverage'].get('max', 25))
+                except: pass
             
             final_leverage = min(TARGET_LEVERAGE, int(max_lev))
-            
-            # B. Risk Calc (1% of Equity)
-            # Qty = Risk ($) / |Entry - SL|
             margin_cost = total_equity * RISK_PERCENT
             
-            # 2. Calculate Total Position Value (Notional)
-            # Example: $1.00 Cost * 25x Leverage = $25.00 Position
-            position_value = margin_cost * final_leverage
+            # --- ATR Volatility Risk Sizing ---
+            natr_val = float(natr) if natr else 0.0
+            multiplier = 1.0
+            if natr_val > 15.0: multiplier = 0.5     # Extreme Meme Volatility (Half Risk)
+            elif natr_val > 8.0: multiplier = 0.75   # High Volatility (Trim Risk)
             
-            # 3. Calculate Quantity in Coins
-            # Example: $25.00 / $0.50 Entry = 50 Coins
+            position_value = (margin_cost * final_leverage) * multiplier
             qty_coins = position_value / entry
             
-            # Check Min Notional (Approx $6 for Bybit)
-            notional = qty_coins * entry
-            if position_value < 6.0:
-                logger.warning(f"⚠️ Signal {sym} skipped: Position value ${position_value:.2f} is below Bybit min ($6).")
-                continue
+            # Most CEX require minimal mapping (~$5-$6 value)
+            if position_value < 6.0: continue
 
-            # C. Insert PENDING Trade
             cur.execute("""
                 INSERT INTO active_trades (signal_id, symbol, side, entry_price, sl_price, tp1, tp2, tp3, quantity, leverage, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
             """, (sig_id, sym, side, entry, sl, tp1, tp2, tp3, qty_coins, final_leverage))
             
             logger.info(f"📥 Signal Ingested: {sym} | Lev: {final_leverage}x | Cost: ${margin_cost:.2f}")
             current_active += 1
             
         conn.commit()
-    except Exception as e:
-        logger.error(f"Ingest Error: {e}")
-    finally:
-        release_conn(conn)
+    except Exception as e: logger.error(f"Ingest Error: {e}")
+    finally: release_conn(conn)
 
-# ---------------------------------------------------------
-# 🚀 SMART EXECUTION (Limit or Market)
-# ---------------------------------------------------------
 def execute_pending_orders():
-    """
-    Checks PENDING orders.
-    - If price is BETTER than entry -> MARKET Buy.
-    - If price is WORSE than entry -> LIMIT Buy.
-    """
+    exchange = active_engine['exchange']
+    if not exchange: return
+    
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("SELECT id, symbol, side, entry_price, sl_price, quantity, leverage FROM active_trades WHERE status = 'PENDING'")
         orders = cur.fetchall()
-        
         if not orders: return 
 
         for order in orders:
             oid, sym, side, entry, sl, qty, lev = order
-            
             try:
-                # 1. Set Leverage
                 try: exchange.set_leverage(int(lev), sym)
                 except: pass
 
-                # 2. Check LIVE Price
                 ticker = exchange.fetch_ticker(sym)
                 current_price = float(ticker['last'])
                 entry = float(entry)
                 
-                # Logic: Is the price better than our entry?
-                is_better_price = (side == 'Long' and current_price <= entry) or \
-                                  (side == 'Short' and current_price >= entry)
-
+                is_better_price = (side == 'Long' and current_price <= entry) or (side == 'Short' and current_price >= entry)
                 type_side = 'buy' if side == 'Long' else 'sell'
-                params = {'stopLoss': float(sl)}
                 
-                # Precision Handling
+                params = {'stopLoss': float(sl)}
                 qty = float(exchange.amount_to_precision(sym, qty))
                 
-                res = None
-                
-                # 3. Decision
                 if is_better_price:
-                    logger.info(f"⚡ {sym}: Price Better ({current_price} vs {entry}). Executing MARKET...")
                     res = exchange.create_order(sym, 'market', type_side, qty, None, params)
                 else:
-                    logger.info(f"⏳ {sym}: Waiting ({current_price} vs {entry}). Placing LIMIT...")
                     res = exchange.create_order(sym, 'limit', type_side, entry, qty, params)
                 
-                # 4. Update DB
                 if res and 'id' in res:
-                    new_status = 'OPEN' 
-                    # If Market order, it fills instantly, so next loop will catch TPs via Safety Net or WS
-                    cur.execute("UPDATE active_trades SET order_id = %s, status = %s WHERE id = %s", (res['id'], new_status, oid))
+                    cur.execute("UPDATE active_trades SET order_id = ?, status = 'OPEN' WHERE id = ?", (res['id'], oid))
                     conn.commit()
                     logger.info(f"✅ Order Placed for {sym} (ID: {res['id']})")
-
             except Exception as e:
                 logger.error(f"❌ Execution Failed {sym}: {e}")
-                cur.execute("UPDATE active_trades SET status = 'FAILED' WHERE id = %s", (oid,))
-                
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Exec Loop Error: {e}")
-    finally:
-        release_conn(conn)
+                cur.execute("UPDATE active_trades SET status = 'FAILED' WHERE id = ?", (oid,))
+                conn.commit()
+    except Exception as e: logger.error(f"Exec Loop Error: {e}")
+    finally: release_conn(conn)
 
-# ---------------------------------------------------------
-# 🛡️ SAFETY NET (Robust Version)
-# ---------------------------------------------------------
 def check_missed_tps():
-    """
-    Backup loop: Checks for trades that are marked 'OPEN' in DB
-    but are already FILLED on the exchange.
-    """
+    exchange = active_engine['exchange']
+    if not exchange: return
+    
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, symbol, side, order_id, tp1, tp2, tp3 
-            FROM active_trades 
-            WHERE status = 'OPEN' AND order_id IS NOT NULL
-        """)
+        cur.execute("SELECT id, symbol, side, order_id, tp1, tp2, tp3 FROM active_trades WHERE status = 'OPEN' AND order_id IS NOT NULL")
         stuck_trades = cur.fetchall()
-        
         for trade in stuck_trades:
             t_id, sym, side, oid, tp1, tp2, tp3 = trade
-            
             try:
                 order_status = None
-                
-                # 1. Try Fetch Order (with suppression param)
                 try:
-                    # 'acknowledged': True silences the "last 500 orders" warning
-                    order = exchange.fetch_order(oid, sym, params={'acknowledged': True})
+                    order = exchange.fetch_order(oid, sym)
                     order_status = order['status']
-                except Exception as e:
-                    # If fetch_order fails (e.g. order too old), search Closed Orders manually
-                    # logger.warning(f"Fetch Order failed for {sym}, searching history... {e}")
-                    pass
+                except: pass
 
-                # 2. Fallback: Search Recent History if direct fetch failed
-                if not order_status:
-                    try:
-                        # Look in last 50 closed orders
-                        closed_orders = exchange.fetch_closed_orders(sym, limit=50)
-                        for o in closed_orders:
-                            if str(o['id']) == str(oid):
-                                order_status = o['status']
-                                break
-                    except: pass
-                
-                # 3. Process Status
                 if order_status == 'closed':
-                    # It is FILLED! We missed the WebSocket event.
-                    logger.warning(f"⚠️ Safety Net: Found filled entry for {sym} (ID: {oid}). Placing TPs...")
-                    
                     pos = exchange.fetch_position(sym)
-                    size = float(pos['contracts'])
-                    
+                    size = float(pos.get('contracts', 0))
                     if size > 0:
-                        success = place_split_tps(sym, side, size, tp1, tp2, tp3)
-                        if success:
-                            cur.execute("UPDATE active_trades SET status = 'OPEN_TPS_SET', updated_at = NOW() WHERE id = %s", (t_id,))
+                        if place_split_tps(sym, side, size, tp1, tp2, tp3):
+                            cur.execute("UPDATE active_trades SET status = 'OPEN_TPS_SET', updated_at = datetime('now') WHERE id = ?", (t_id,))
                             conn.commit()
-                            logger.info(f"✅ Safety Net: TPs recovered for {sym}")
-                            
-                elif order_status == 'canceled':
-                    cur.execute("UPDATE active_trades SET status = 'CANCELLED' WHERE id = %s", (t_id,))
+                            logger.info(f"✅ TP Recovered for {sym}")
+                elif order_status in ['canceled', 'rejected']:
+                    cur.execute("UPDATE active_trades SET status = 'CANCELLED' WHERE id = ?", (t_id,))
                     conn.commit()
-                    logger.info(f"🗑️ Safety Net: Marked {sym} as CANCELLED.")
-                    
-            except Exception as e:
-                logger.error(f"Safety Check Error {sym}: {e}")
-                
-    except Exception as e:
-        logger.error(f"Global Safety Loop Error: {e}")
-    finally:
-        release_conn(conn)
+            except: pass
+    except: pass
+    finally: release_conn(conn)
 
-# ---------------------------------------------------------
-# 📊 DAILY REPORTING
-# ---------------------------------------------------------
-def generate_daily_report():
-    logger.info("📊 Generating Daily Report...")
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT 
-                COUNT(*),
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END),
-                SUM(pnl),
-                MAX(pnl),
-                MIN(pnl)
-            FROM active_trades 
-            WHERE status = 'CLOSED' 
-            AND updated_at >= NOW() - INTERVAL '24 hours'
-        """)
-        row = cur.fetchone()
-        
-        if row and row[0] > 0:
-            total, wins, losses, pnl, best, worst = row
-            pnl = pnl if pnl else 0
-            win_rate = (wins/total)*100
-            
-            # Fetch symbols
-            cur.execute("SELECT symbol FROM active_trades WHERE pnl = %s LIMIT 1", (best,))
-            b_sym = cur.fetchone(); best_sym = b_sym[0] if b_sym else "-"
-            
-            cur.execute("SELECT symbol FROM active_trades WHERE pnl = %s LIMIT 1", (worst,))
-            w_sym = cur.fetchone(); worst_sym = w_sym[0] if w_sym else "-"
-            
-            cur.execute("""
-                INSERT INTO daily_reports (report_date, total_pnl, win_rate, total_wins, total_losses, total_trades, best_trade_symbol, best_trade_pnl, worst_trade_symbol, worst_trade_pnl)
-                VALUES (CURRENT_DATE, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (report_date) DO NOTHING
-            """, (pnl, win_rate, wins, losses, total, best_sym, best, worst_sym, worst))
-            conn.commit()
-            logger.info(f"✅ Report Generated: ${pnl:.2f} ({wins}W/{losses}L)")
-            
-    except Exception as e:
-        logger.error(f"Report Error: {e}")
-    finally:
-        release_conn(conn)
-
-# ---------------------------------------------------------
-# 🏁 MAIN
-# ---------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("🟢 Starting Auto-Trader (Hybrid Architecture)...")
-    
-    # 1. Init DB
+    logger.info("🟢 Starting Multi-CEX Auto-Trader...")
     init_execution_db()
     
-    # 2. Start WebSocket (Background Thread)
-    ws = WebSocket(
-        testnet=False,
-        channel_type="private",
-        api_key=CONFIG['api']['bybit_key'],
-        api_secret=CONFIG['api']['bybit_secret'],
-    )
-    ws.execution_stream(callback=on_execution_update)
-    ws.position_stream(callback=on_position_update)
-    logger.info("🔌 WebSocket Connected.")
-    
-    # 3. Schedule Jobs (Foreground)
-    schedule.every(1).minutes.do(ingest_fresh_signals)      # Check for new trades
-    schedule.every(5).seconds.do(execute_pending_orders)    # Fast Execution
-    schedule.every(10).seconds.do(check_missed_tps)         # Safety Net
-    schedule.every().day.at("00:00").do(generate_daily_report)
+    schedule.every(3).seconds.do(sync_active_exchange)
+    schedule.every(10).seconds.do(ccxt_poll_positions) # Fallback for Binance/Bitget
+    schedule.every(1).minutes.do(ingest_fresh_signals)      
+    schedule.every(5).seconds.do(execute_pending_orders)    
+    schedule.every(20).seconds.do(check_missed_tps)         
     
     logger.info(f"🚀 Bot is LIVE. Monitoring {MAX_POSITIONS} Max Positions.")
-    
     while True:
         schedule.run_pending()
         time.sleep(1)

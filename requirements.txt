@@ -5,7 +5,7 @@ numpy
 schedule
 requests
 mplfinance
-psycopg2-binary
+pybit
 scipy
 python-dotenv
 streamlit

@@ -1,17 +1,23 @@
-import psycopg2
-from psycopg2 import pool
+"""
+Tujuan: Mengelola koneksi database secara eksklusif menggunakan SQLite untuk performa ringan dan penghapusan dependensi yang berat.
+Caller: main.py, auto_trades.py, telegram_listener.py, execution.py
+Dependensi: sqlite3, modules.config_loader
+Main Functions: init_db(), get_conn(), release_conn(), migrate_schema(), get_dict_cursor(), get_active_cex(), set_active_cex()
+Side Effects: Membaca dan menulis ke file futurabot.sqlite di direktori lokal.
+"""
+
 import sqlite3
+import os
 from modules.config_loader import CONFIG
 
-DB_POOL = None
-IS_SQLITE = False
+DB_FILE = 'futurabot.sqlite'
 
 class SQLiteCursorWrapper:
     def __init__(self, cursor):
         self.cursor = cursor
 
     def execute(self, query, params=None):
-        # Convert PostgreSQL parameter bindings
+        # Convert PostgreSQL parameter bindings '%s' to sqlite '?' safely
         query = query.replace('%s', '?')
         
         if params is not None:
@@ -55,82 +61,32 @@ class SQLiteConnWrapper:
 
 
 def init_db():
-    global DB_POOL, IS_SQLITE
-    db_host = CONFIG['database'].get('host', '').strip()
-    
-    if not db_host:
-        print("⚠️ No Postgres host found. Falling back to SQLite.")
-        IS_SQLITE = True
-        conn = get_conn()
-        migrate_schema(conn)
-        release_conn(conn)
-        print("✅ SQLite Connected & Schema Synced.")
-        return
-
-    try:
-        pool_size = CONFIG['system'].get('max_threads', 20) + 5
-        DB_POOL = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1, maxconn=pool_size,
-            host=CONFIG['database']['host'], 
-            database=CONFIG['database']['database'],
-            user=CONFIG['database']['user'], 
-            password=CONFIG['database']['password'],
-            port=CONFIG['database']['port']
-        )
-        IS_SQLITE = False
-        conn = DB_POOL.getconn()
-        try:
-            migrate_schema(conn)
-        finally:
-            DB_POOL.putconn(conn)
-        print("✅ Database Connected & Schema Synced.")
-        
-    except Exception as e:
-        print(f"❌ DB Init Error (Postgres): {e}")
-        print("⚠️ Falling back to SQLite due to connection failure.")
-        IS_SQLITE = True
-        conn = get_conn()
-        migrate_schema(conn)
-        release_conn(conn)
-        print("✅ SQLite Connected & Schema Synced.")
+    conn = get_conn()
+    migrate_schema(conn)
+    release_conn(conn)
+    print("✅ SQLite Connected & Schema Synced.")
 
 def get_conn():
-    global IS_SQLITE, DB_POOL
-    if IS_SQLITE:
-        conn = sqlite3.connect('bybit_bot.sqlite', check_same_thread=False)
-        return SQLiteConnWrapper(conn)
-        
-    if not DB_POOL: init_db()
-    
-    if IS_SQLITE:
-        conn = sqlite3.connect('bybit_bot.sqlite', check_same_thread=False)
-        return SQLiteConnWrapper(conn)
-        
-    return DB_POOL.getconn()
+    # Use check_same_thread=False for easy threading
+    # Apply WAL mode for better concurrency performance with writes
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return SQLiteConnWrapper(conn)
 
 def release_conn(conn):
-    if IS_SQLITE:
+    try:
         conn.close()
-    elif DB_POOL and not IS_SQLITE:
-        try:
-            if isinstance(conn, SQLiteConnWrapper):
-                conn.close()
-            else:
-                DB_POOL.putconn(conn)
-        except: pass
+    except Exception:
+        pass
 
 def get_dict_cursor(conn):
-    if IS_SQLITE:
-        return conn.cursor(cursor_factory='dict')
-    else:
-        import psycopg2.extras
-        return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    return conn.cursor(cursor_factory='dict')
 
 def migrate_schema(conn):
     cur = conn.cursor()
     
     required_columns = {
-        "id": "SERIAL PRIMARY KEY",
+        "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
         "symbol": "VARCHAR(100)", 
         "side": "VARCHAR(10)", 
         "timeframe": "VARCHAR(5)", 
@@ -154,6 +110,7 @@ def migrate_schema(conn):
         "quant_reasons": "TEXT",
         "deriv_reasons": "TEXT",
         "smc_reasons": "TEXT",
+        "natr": "DECIMAL DEFAULT 0",
         "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", 
         "entry_hit_at": "TIMESTAMP", 
         "closed_at": "TIMESTAMP", 
@@ -162,54 +119,43 @@ def migrate_schema(conn):
         "channel_id": "VARCHAR(50)"
     }
 
-    sqlite_columns = {k: v.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT") for k, v in required_columns.items()}
-    columns_to_use = sqlite_columns if IS_SQLITE else required_columns
-
     try:
-        if IS_SQLITE:
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trades';")
-            table_exists = cur.fetchone() is not None
-        else:
-            cur.execute("SELECT to_regclass('public.trades');")
-            res = cur.fetchone()
-            table_exists = res is not None and res[0] is not None
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trades';")
+        table_exists = cur.fetchone() is not None
             
         if not table_exists:
             print("🆕 Table 'trades' not found. Creating fresh...")
-            cols = [f"{k} {v}" for k, v in columns_to_use.items()]
+            cols = [f"{k} {v}" for k, v in required_columns.items()]
             query = f"CREATE TABLE trades ({', '.join(cols)});"
             cur.execute(query)
             print("✅ Table 'trades' created successfully.")
             
         else:
             print("🔍 Checking 'trades' schema for missing columns...")
-            if IS_SQLITE:
-                cur.execute("PRAGMA table_info('trades');")
-                existing_cols = {row['name'] if isinstance(row, dict) else row[1] for row in cur.fetchall()}
-            else:
-                cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'trades';")
-                existing_cols = {row[0] if not isinstance(row, dict) else row['column_name'] for row in cur.fetchall()}
+            cur.execute("PRAGMA table_info('trades');")
+            existing_cols = {row['name'] if isinstance(row, dict) else row[1] for row in cur.fetchall()}
                 
             missing_cols = []
-            for col, dtype in columns_to_use.items():
+            for col, dtype in required_columns.items():
                 if col not in existing_cols:
-                    clean_type = dtype.replace("SERIAL PRIMARY KEY", "INT").replace("PRIMARY KEY", "").replace("INTEGER PRIMARY KEY AUTOINCREMENT", "INTEGER")
+                    clean_type = dtype.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "INTEGER")
                     missing_cols.append(col + " " + clean_type)
 
             if missing_cols:
-                if IS_SQLITE:
-                    for mc in missing_cols:
-                        cur.execute(f"ALTER TABLE trades ADD COLUMN {mc};")
-                else:
-                    mc_pg = [f"ADD COLUMN IF NOT EXISTS {m}" for m in missing_cols]
-                    alter_query = f"ALTER TABLE trades {', '.join(mc_pg)};"
-                    cur.execute(alter_query)
+                for mc in missing_cols:
+                    cur.execute(f"ALTER TABLE trades ADD COLUMN {mc};")
                 print("✅ Migration Complete.")
             else:
                 print("✅ Schema is up to date.")
 
         cur.execute("CREATE TABLE IF NOT EXISTS bot_state (key_name VARCHAR(50) PRIMARY KEY, value_text TEXT);")
         conn.commit()
+
+        # Check default active_cex
+        cur.execute("SELECT value_text FROM bot_state WHERE key_name = 'active_cex'")
+        if not cur.fetchone():
+            cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES ('active_cex', 'bybit')")
+            conn.commit()
 
     except Exception as e:
         print(f"❌ Migration Failed: {e}")
@@ -262,11 +208,36 @@ def set_risk_config(key, value):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        if IS_SQLITE:
-            cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES (%s, %s) ON CONFLICT(key_name) DO UPDATE SET value_text = excluded.value_text", (key, str(value)))
-        else:
-            cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES (%s, %s) ON CONFLICT (key_name) DO UPDATE SET value_text = EXCLUDED.value_text", (key, str(value)))
+        cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES (%s, %s) ON CONFLICT(key_name) DO UPDATE SET value_text = excluded.value_text", (key, str(value)))
         conn.commit()
         return True
     except: return False
     finally: release_conn(conn)
+
+def get_active_cex():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value_text FROM bot_state WHERE key_name = 'active_cex'")
+        row = cur.fetchone()
+        return row['value_text'] if isinstance(row, dict) and row['value_text'] else (row[0] if row else 'bybit')
+    except: 
+        return 'bybit'
+    finally: 
+        release_conn(conn)
+
+def set_active_cex(platform_name):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        platform = platform_name.lower()
+        if platform not in ['bybit', 'binance', 'bitget']:
+            return False
+        cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES ('active_cex', %s) ON CONFLICT(key_name) DO UPDATE SET value_text = excluded.value_text", (platform,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print("Error saving active CEX:", e)
+        return False
+    finally: 
+        release_conn(conn)

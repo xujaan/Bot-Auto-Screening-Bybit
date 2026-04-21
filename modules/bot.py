@@ -1,3 +1,11 @@
+"""
+Tujuan: Memformat payload sinyal dan mengirimkan alert/notifikasi via Telegram.
+Caller: main.py
+Dependensi: requests, matplotlib, pandas, database, config_loader
+Main Functions: send_telegram_alert(), update_telegram_dashboard(), send_alert(), run_fast_update()
+Side Effects: Mengirim POST HTTP ke Telegram API. Writes image temporary ke disk.
+"""
+
 import requests, json, os, pytz, pandas as pd, numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -5,7 +13,7 @@ import mplfinance as mpf
 from scipy.signal import argrelextrema
 from datetime import datetime
 from modules.config_loader import CONFIG
-from modules.database import get_conn, release_conn, get_dict_cursor
+from modules.database import get_conn, release_conn, get_dict_cursor, get_active_cex
 
 def get_now(): return datetime.now(pytz.timezone(CONFIG['system']['timezone']))
 def format_price(value): return "{:.8f}".format(float(value)).rstrip('0').rstrip('.') if float(value) < 1 else "{:.2f}".format(float(value))
@@ -51,25 +59,46 @@ def generate_chart(df, symbol, pattern, timeframe):
 def send_telegram_alert(data, image_path=None):
     token = CONFIG['api'].get('telegram_bot_token')
     chat_id = CONFIG['api'].get('telegram_chat_id')
-    if not token or not chat_id: return False
+    if not token or not chat_id: return False, None
     
     emoji = "🚀" if data['Side'] == 'Long' else "🔻"
     current_price = data['df']['close'].iloc[-1]
     ts = get_now().strftime('%Y-%m-%d %H:%M:%S')
+    active_cex = get_active_cex().upper()
     
-    text = f"<b>{emoji} SIGNAL: {data['Symbol']} ({data['Pattern']})</b>\n"
-    text += f"<b>{data['Side']}</b> | <b>{data['Timeframe']}</b>\n"
+    rvol = data['df']['RVOL'].iloc[-1]
+    rvol_txt = "Explosive" if rvol > 3.0 else ("Strong" if rvol > 2.0 else "Normal")
+    
+    fund_rate = data['df'].get('funding', pd.Series([0])).iloc[-1]
+    if isinstance(fund_rate, pd.Series): fund_rate = fund_rate.iloc[-1]
+    fund_pct = fund_rate * 100
+    
+    smc_reasons_str = str(data.get('SMC_Reasons', ''))
+    smc_txt = "None"
+    if "Order Block" in smc_reasons_str: smc_txt = "Bullish Demand" if "Bullish" in smc_reasons_str else "Bearish Supply"
+    elif data.get('SMC_Score', 0) > 0: smc_txt = "Confluence Found"
+    
+    text = f"<b>{emoji} SIGNAL: {data['Symbol']} </b>\n"
+    text += f"🏢 CEX: <b>{active_cex}</b>\n"
+    text += f"🧭 <b>{data['Side']}</b> | <b>{data['Timeframe']}</b> | {data['Pattern']}\n"
     text += f"🕒 <code>{ts}</code>\n\n"
     text += f"💵 <b>Current:</b> <code>{format_price(current_price)}</code>\n"
     text += f"🎯 <b>Entry:</b> <code>{format_price(data['Entry'])}</code>\n"
-    text += f"🛑 <b>Stop:</b> <code>{format_price(data['SL'])}</code>\n"
-    text += f"💰 <b>RR:</b> 1:{data.get('RR', 0.0)}\n\n"
+    text += f"🛑 <b>Stop Loss:</b> <code>{format_price(data['SL'])}</code>\n"
+    text += f"💰 <b>Risk/Reward:</b> 1:{data.get('RR', 0.0)}\n\n"
     text += f"🏁 <b>Targets:</b>\n"
     text += f"TP1: <code>{format_price(data['TP1'])}</code>\n"
     text += f"TP2: <code>{format_price(data['TP2'])}</code>\n"
     text += f"TP3: <code>{format_price(data['TP3'])}</code>\n\n"
+    
+    text += f"🧮 <b>Quant & Derivs:</b>\n"
+    text += f"• RVOL: <code>{rvol:.1f}x</code> ({rvol_txt})\n"
+    text += f"• Z-Score: <code>{data.get('Z_Score', 0):.2f}σ</code>\n"
+    text += f"• OBI: <code>{data.get('OBI', 0.0):.2f}</code>\n"
+    text += f"• Funding: <code>{fund_pct:.4f}%</code>\n\n"
+    
     text += f"🏆 <b>Scores:</b>\nTech: <code>{data.get('Tech_Score',0)}</code> | SMC: <code>{data.get('SMC_Score',0)}</code> | Quant: <code>{data.get('Quant_Score',0)}</code> | Deriv: <code>{data.get('Deriv_Score',0)}</code>\n"
-    text += f"🧠 <b>Bias:</b> {data.get('BTC_Bias', '-')}"
+    text += f"🧠 <b>BTC Bias:</b> {data.get('BTC_Bias', '-')}"
     
     url = f"https://api.telegram.org/bot{token}/"
     
@@ -83,25 +112,26 @@ def send_telegram_alert(data, image_path=None):
                     [{"text": f"⚡ Start Trade {data['Symbol']}", "callback_data": f"trade_{data['Symbol']}"}]
                 ]
             }
-    except Exception as e:
-        print(f"Error fetching risk config for tg button: {e}")
+    except: pass
         
+    msg_id = None
     try:
         if image_path and os.path.exists(image_path):
             data_payload = {'chat_id': chat_id, 'caption': text, 'parse_mode': 'HTML'}
-            if reply_markup:
-                data_payload['reply_markup'] = json.dumps(reply_markup)
+            if reply_markup: data_payload['reply_markup'] = json.dumps(reply_markup)
             with open(image_path, 'rb') as f:
-                requests.post(url + 'sendPhoto', data=data_payload, files={'photo': f})
+                r = requests.post(url + 'sendPhoto', data=data_payload, files={'photo': f})
         else:
             json_payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
-            if reply_markup:
-                json_payload['reply_markup'] = reply_markup
-            requests.post(url + 'sendMessage', json=json_payload)
-        return True
+            if reply_markup: json_payload['reply_markup'] = reply_markup
+            r = requests.post(url + 'sendMessage', json=json_payload)
+            
+        if r.status_code == 200:
+            msg_id = r.json().get('result', {}).get('message_id')
+        return True, msg_id
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
-        return False
+        return False, None
 
 def update_telegram_dashboard(lines_text):
     token = CONFIG['api'].get('telegram_bot_token')
@@ -116,7 +146,7 @@ def update_telegram_dashboard(lines_text):
         cur = conn.cursor()
         cur.execute("SELECT value_text FROM bot_state WHERE key_name = 'telegram_dashboard_msg_id'")
         row = cur.fetchone()
-        msg_id = row[0] if row else None
+        msg_id = row['value_text'] if row and isinstance(row, dict) else (row[0] if row else None)
         
         success = False
         if msg_id:
@@ -128,123 +158,40 @@ def update_telegram_dashboard(lines_text):
             if r.status_code == 200:
                 new_id = r.json().get('result', {}).get('message_id')
                 if new_id:
-                    cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES ('telegram_dashboard_msg_id', %s) ON CONFLICT (key_name) DO UPDATE SET value_text = EXCLUDED.value_text", (str(new_id),))
+                    cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES ('telegram_dashboard_msg_id', ?) ON CONFLICT (key_name) DO UPDATE SET value_text = excluded.value_text", (str(new_id),))
                     conn.commit()
     except Exception as e:
         print(f"TG Dashboard Error: {e}")
     finally: release_conn(conn)
 
 def send_alert(data):
-    webhook = CONFIG['api'].get('discord_webhook')
     tg_token = CONFIG['api'].get('telegram_bot_token')
-    
-    if not webhook and not tg_token: return False
+    if not tg_token: return False
     
     symbol = data['Symbol']
     
-    # 1. Generate Chart
     image_path = None
-    try:
-        image_path = generate_chart(data['df'], symbol, data['Pattern'], data['Timeframe'])
-    except Exception as e:
-        print(f"❌ Chart Error: {e}")
+    try: image_path = generate_chart(data['df'], symbol, data['Pattern'], data['Timeframe'])
+    except Exception as e: print(f"❌ Chart Error: {e}")
 
-    # 2. Telegram Send
-    tg_sent = False
-    if tg_token:
-        tg_sent = send_telegram_alert(data, image_path)
+    tg_sent, msg_id = send_telegram_alert(data, image_path)
 
-    # 3. Discord Send
-    discord_sent = False
-    msg_id = None
-    channel_id = None
-    
-    if webhook:
-        try:
-            is_long = data['Side'] == 'Long'
-            color = 0x00ff00 if is_long else 0xff0000
-            emoji = "🚀" if is_long else "🔻"
-            
-            rvol = data['df']['RVOL'].iloc[-1]
-            rvol_txt = "⚡ Explosive" if rvol > 3.0 else ("🔥 Strong" if rvol > 2.0 else "🌊 Normal")
-            obi_val = data.get('OBI', 0.0)
-            obi_icon = "🟢" if obi_val > 0 else ("🔴" if obi_val < 0 else "⚪")
-            
-            quant_block = f"**RVOL:** `{rvol:.1f}x` ({rvol_txt})\n**Z-Score:** `{data.get('Z_Score', 0):.2f}σ`\n**ζ-Field:** `{data.get('Zeta_Score', 0):.1f}` / 100\n**OBI:** `{obi_val:.2f}` {obi_icon}"
-
-            fund_rate = data['df'].get('funding', pd.Series([0])).iloc[-1]
-            if isinstance(fund_rate, pd.Series): fund_rate = fund_rate.iloc[-1]
-            fund_pct = fund_rate * 100
-            fund_icon = "🔴" if fund_pct > 0.01 else "🟢"
-            fund_txt = "Hot" if fund_pct > 0.01 else "Cool"
-            basis_pct = data.get('Basis', 0) * 100
-            deriv_block = f"**Funding:** `{fund_pct:.4f}%` {fund_icon} ({fund_txt})\n**Basis:** `{basis_pct:.4f}%`\n**Bias:** {data.get('Deriv_Reasons', 'Neutral')}"
-
-            smc_reasons_str = str(data.get('SMC_Reasons', ''))
-            smc_txt = "None"
-            if "Order Block" in smc_reasons_str:
-                smc_txt = "🟢 Demand Zone" if "Bullish" in smc_reasons_str else "🔴 Supply Zone"
-            elif "Structure" in smc_reasons_str:
-                smc_txt = "📈 Higher Low" if "Higher Low" in smc_reasons_str else "📉 Lower High"
-            elif data.get('SMC_Score', 0) > 0:
-                smc_txt = "✅ Confluence Found"
-
-            scores_txt = f"Tech: `{data.get('Tech_Score',0)}` | SMC: `{data.get('SMC_Score',0)}` | Quant: `{data.get('Quant_Score',0)}` | Deriv: `{data.get('Deriv_Score',0)}`"
-            analysis_txt = f"**Tech:** {data.get('Tech_Reasons', '-')}\n**SMC:** {smc_reasons_str if smc_reasons_str else '-'}\n**Quant:** {data.get('Quant_Reasons', '-')}"
-            legend_txt = "• **Z-Score:** `>3.0`=Nuclear | **ζ-Field:** `>70`=High Prob\n• **OBI:** `>0.3`=Bullish Book | **Funding:** `>0.01%`=Expensive"
-
-            embed = {
-                "title": f"{emoji} SIGNAL: {symbol} ({data['Pattern']})",
-                "description": f"**{data['Side']}** | **{data['Timeframe']}**",
-                "color": color,
-                "fields": [
-                    {"name": "🎯 Entry", "value": f"`{format_price(data['Entry'])}`", "inline": True},
-                    {"name": "🛑 Stop", "value": f"`{format_price(data['SL'])}`", "inline": True},
-                    {"name": "💰 Rewards", "value": f"RR: **1:{data.get('RR', 0.0)}**", "inline": True},
-                    {"name": "🏁 Targets", "value": f"TP1: `{format_price(data['TP1'])}`\nTP2: `{format_price(data['TP2'])}`\nTP3: `{format_price(data['TP3'])}`", "inline": False},
-                    {"name": "📊 Technicals", "value": f"**Pattern:** {data['Pattern']}\n**Trend:** {emoji} {data['Side']}\n**SMC:** {smc_txt}", "inline": False},
-                    {"name": "🧮 Quant Models", "value": quant_block, "inline": True},
-                    {"name": "⛽ Derivatives", "value": deriv_block, "inline": True},
-                    {"name": "🏆 Scores", "value": scores_txt, "inline": False},
-                    {"name": "📝 Detailed Analysis", "value": analysis_txt, "inline": False},
-                    {"name": "ℹ️ Metrics Guide", "value": legend_txt, "inline": False},
-                    {"name": "🧠 Context", "value": f"Bias: **{data.get('BTC_Bias','')}**", "inline": False}
-                ],
-                "footer": {"text": f"V8 Bot | {get_now().strftime('%Y-%m-%d %H:%M:%S')}"}
-            }
-            
-            payload = {"content": "", "embeds": [embed]}
-            if image_path and os.path.exists(image_path):
-                with open(image_path, 'rb') as f:
-                    r = requests.post(webhook, data={'payload_json': json.dumps(payload)}, files={'file': f}, params={"wait": "true"})
-            else:
-                r = requests.post(webhook, json=payload, params={"wait": "true"})
-                
-            if r.status_code in [200, 201]:
-                discord_sent = True
-                msg_id = r.json().get('id')
-                channel_id = r.json().get('channel_id')
-        except Exception as e:
-            print(f"Discord Alert Error: {e}")
-
-    # Remove image
     if image_path and os.path.exists(image_path): os.remove(image_path)
 
-    # 4. Save to DB
-    if discord_sent or tg_sent:
+    if tg_sent:
         try:
             conn = get_conn()
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO trades (symbol, side, timeframe, pattern, entry_price, sl_price, tp1, tp2, tp3, reason, 
                 tech_score, quant_score, deriv_score, smc_score, basis, btc_bias, z_score, zeta_score, obi, 
-                tech_reasons, quant_reasons, deriv_reasons, smc_reasons, message_id, channel_id, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Waiting Entry')
+                tech_reasons, quant_reasons, deriv_reasons, smc_reasons, message_id, status, natr)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Waiting Entry', ?)
             """, (symbol, data['Side'], data['Timeframe'], data['Pattern'], data['Entry'], data['SL'], data['TP1'], 
                   data['TP2'], data['TP3'], data.get('Reason',''), data.get('Tech_Score',0), data.get('Quant_Score',0), data.get('Deriv_Score',0), 
                   data.get('SMC_Score',0), data.get('Basis',0), data.get('BTC_Bias',''), data.get('Z_Score',0), data.get('Zeta_Score',0), data.get('OBI',0), 
                   data.get('Tech_Reasons',''), data.get('Quant_Reasons',''), data.get('Deriv_Reasons',''), str(data.get('SMC_Reasons','')),
-                  msg_id, channel_id))
+                  msg_id, data.get('NATR', 0.0)))
             conn.commit()
             release_conn(conn)
             return True
@@ -254,6 +201,7 @@ def send_alert(data):
     return False
 
 def update_status_dashboard():
+    # Only updates Telegram Dashboard now
     conn = get_conn()
     lines = []
     try:
@@ -265,82 +213,22 @@ def update_status_dashboard():
             if isinstance(t_val, str) and len(t_val) >= 16: return t_val[11:16]
             return str(t_val)
         lines = [f"`{fmt_time(t['entry_hit_at'] or t['created_at'])}` {'🟢' if 'Active' in t['status'] else '⏳'} **{t['symbol']}** ({t['side']}): {t['status']}" for t in trades]
-    except Exception as e:
-        print(f"Failed to fetch trades for dashboard: {e}")
+    except Exception as e: pass
     finally: release_conn(conn)
     
     text_lines = "\n".join(lines) if lines else "No active trades."
-    
-    # 1. Update Telegram Dashboard (Disabled here per user request, moved to /live command)
-    # update_telegram_dashboard(text_lines)
-    
-    # 2. Update Discord Dashboard
-    webhook = CONFIG['api'].get('discord_dashboard_webhook')
-    if webhook:
-        content = "**📊 LIVE DASHBOARD**\n" + text_lines
-        conn = get_conn()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT value_text FROM bot_state WHERE key_name = 'dashboard_msg_id'")
-            row = cur.fetchone()
-            msg_id = row[0] if row else None
-            
-            if msg_id: requests.patch(f"{webhook}/messages/{msg_id}", json={"content": content})
-            else:
-                r = requests.post(webhook, json={"content": content}, params={"wait": "true"})
-                if r.status_code in [200, 201]:
-                    new_id = r.json().get('id')
-                    cur.execute("INSERT INTO bot_state (key_name, value_text) VALUES ('dashboard_msg_id', %s) ON CONFLICT (key_name) DO UPDATE SET value_text = EXCLUDED.value_text", (str(new_id),))
-                    conn.commit()
-        except: pass
-        finally: release_conn(conn)
+    # update_telegram_dashboard(text_lines) # Disabled per user preference
 
 def send_scan_completion(count, duration, bias):
-    # Telegram
     tg_token = CONFIG['api'].get('telegram_bot_token')
     tg_chat = CONFIG['api'].get('telegram_chat_id')
+    active_cex = get_active_cex().upper()
     if tg_token and tg_chat:
         icon = "🟢" if "Bullish" in bias else ("🔴" if "Bearish" in bias else "⚪")
-        text = f"🔭 <b>Scan Cycle Complete</b>\n\n⏱️ <b>Duration:</b> <code>{duration:.2f}s</code>\n📶 <b>Signals:</b> <code>{count}</code>\n📊 <b>Bias:</b> {icon} <b>{bias}</b>"
+        text = f"🔭 <b>Scan Cycle Complete ({active_cex})</b>\n\n⏱️ <b>Duration:</b> <code>{duration:.2f}s</code>\n📶 <b>Signals Found:</b> <code>{count}</code>\n📊 <b>Global Bias:</b> {icon} <b>{bias}</b>"
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
         try: requests.post(url, json={'chat_id': tg_chat, 'text': text, 'parse_mode': 'HTML'})
         except: pass
 
-    # Discord
-    webhook = CONFIG['api'].get('discord_webhook')
-    if webhook:
-        color = 0x00ff00 if "Bullish" in bias else (0xff0000 if "Bearish" in bias else 0x808080)
-        embed = {"title": "🔭 Scan Cycle Complete", "color": color, "fields": [{"name": "⏱️ Duration", "value": f"`{duration:.2f}s`", "inline": True}, {"name": "📶 Signals", "value": f"`{count}`", "inline": True}, {"name": "📊 Bias", "value": f"**{bias}**", "inline": True}]}
-        try: requests.post(webhook, json={"embeds": [embed]})
-        except: pass
-
 def run_fast_update(exchange=None):
     update_status_dashboard()
-    
-    if exchange:
-        try:
-            import modules.execution as execution
-            conn = get_conn()
-            cur = get_dict_cursor(conn)
-            cur.execute("SELECT * FROM trades WHERE status = 'Waiting Entry'")
-            waiting_trades = cur.fetchall()
-            
-            if waiting_trades:
-                positions = exchange.fetch_positions()
-                pos_map = {p['symbol']: p for p in positions if float(p['contracts']) > 0}
-                
-                for t in waiting_trades:
-                    sym = t['symbol']
-                    if sym in pos_map:
-                        pos = pos_map[sym]
-                        pos_side = pos['side']
-                        total_qty = float(pos['contracts'])
-                        # execution.place_layered_tps(exchange, sym, pos_side, float(t['tp1']), float(t['tp2']), float(t['tp3']), total_qty)
-                        
-                        cur.execute("UPDATE trades SET status = 'Active (TP3 Set Natively)' WHERE id = %s", (t['id'],))
-                conn.commit()
-        except Exception as e:
-            print("AutoTrade TP Error:", e)
-        finally:
-            if 'conn' in locals() and conn:
-                release_conn(conn)

@@ -1,7 +1,15 @@
+"""
+Tujuan: Menangani perintah dari user via Telegram Poller.
+Caller: main.py
+Dependensi: requests, sqlite3
+Main Functions: TelegramListener.poll(), TelegramListener.handle_command()
+Side Effects: Membaca/Update setting di bot_state SQLite. Mengirim perintah execute/close ke CEX via auto_trades fallback.
+"""
+
 import time
 import requests
 import threading
-from modules.database import set_risk_config, get_risk_config
+from modules.database import set_risk_config, get_risk_config, set_active_cex, get_active_cex
 from modules.config_loader import CONFIG
 
 class TelegramListener:
@@ -18,15 +26,16 @@ class TelegramListener:
         try:
             url = f"https://api.telegram.org/bot{self.token}/setMyCommands"
             commands = [
-                {"command": "status", "description": "Tampilkan PnL Live & tombol tutup posisi"},
-                {"command": "live", "description": "Lihat rekap trade dari Database"},
-                {"command": "pending", "description": "Lihat Limit Order yang sedang antre di Bybit"},
-                {"command": "scan", "description": "Paksa bot melakukan screening pasar saat ini juga"},
-                {"command": "reset", "description": "Hapus semua data riwayat screening di DB"},
-                {"command": "autotrade", "description": "ON/OFF fitur Auto Trade"},
-                {"command": "setcapital", "description": "Atur modal total trading"},
-                {"command": "setkuota", "description": "Atur batas jumlah koin berjalan"},
-                {"command": "statusrisk", "description": "Cek setelan Autotrade, Modal, Kuota"}
+                {"command": "status", "description": "Show live positions & fast close actions"},
+                {"command": "live", "description": "Show DB live dashboard & pending signals"},
+                {"command": "pending", "description": "Retrieve limit orders queue in Exchange"},
+                {"command": "scan", "description": "Force manual market scan instantly"},
+                {"command": "reset", "description": "Erase all old histories from database"},
+                {"command": "autotrade", "description": "Toggle Autotrade ON/OFF"},
+                {"command": "setcapital", "description": "Set trading equity config"},
+                {"command": "setquota", "description": "Set maximum allowed open pairs"},
+                {"command": "statusrisk", "description": "Check configuration defaults"},
+                {"command": "cex", "description": "Switch Active CEX [binance/bitget/bybit]"}
             ]
             requests.post(url, json={"commands": commands}, timeout=5)
         except Exception as e:
@@ -77,7 +86,7 @@ class TelegramListener:
                 conn = get_conn()
                 try:
                     cur = get_dict_cursor(conn)
-                    cur.execute("SELECT * FROM trades WHERE symbol = %s AND status = 'Waiting Entry' ORDER BY created_at DESC LIMIT 1", (symbol,))
+                    cur.execute("SELECT * FROM trades WHERE symbol = ? AND status = 'Waiting Entry' ORDER BY created_at DESC LIMIT 1", (symbol,))
                     trade = cur.fetchone()
                     
                     if trade:
@@ -95,8 +104,8 @@ class TelegramListener:
                         active_pos_count = 0
                         try:
                             positions = self.exchange.fetch_positions()
-                            active_pos_count = len([p for p in positions if float(p['contracts']) > 0])
-                        except Exception as e: print("Gagal fetch pos limit:", e)
+                            active_pos_count = len([p for p in positions if float(p.get('contracts', 0)) > 0])
+                        except: pass
                         
                         if active_pos_count < risk_cfg.get('max_concurrent_trades', 2):
                             result = execute_entry(self.exchange, res)
@@ -110,21 +119,14 @@ class TelegramListener:
                                     f"📦 <b>Quantity:</b> <code>{result['qty']}</code>\n"
                                     f"🔩 <b>Leverage:</b> <code>{result['leverage']}x</code>\n"
                                     f"💵 <b>Margin Used:</b> <code>${result['margin']:.2f}</code>\n"
-                                    f"💰 <b>Total Capital:</b> <code>${result['total_cap']:.2f}</code>\n"
                                     f"🛑 <b>Stop Loss:</b> <code>{fmt_price(result['sl'])}</code>\n"
-                                    f"🩸 <b>Est. Liq Price:</b> <code>{fmt_price(result['liq_price'])}</code>\n"
                                     f"🛒 <b>Order ID:</b> <code>{result['order_id']}</code>"
                                 )
-                            else:
-                                reply = f"❌ Failed to place order for {symbol}."
-                        else:
-                            reply = f"❌ Trade limit reached ({active_pos_count}/{risk_cfg.get('max_concurrent_trades', 2)})"
-                    else:
-                        reply = f"❌ No 'Waiting Entry' found for {symbol}. (Maybe already processed)"
-                except Exception as e:
-                    reply = f"❌ DB Error: {e}"
-                finally:
-                    release_conn(conn)
+                            else: reply = f"❌ Failed to place order for {symbol}."
+                        else: reply = f"❌ Trade limit reached ({active_pos_count}/{risk_cfg.get('max_concurrent_trades', 2)})"
+                    else: reply = f"❌ No 'Waiting Entry' found for {symbol}."
+                except Exception as e: reply = f"❌ DB Error: {e}"
+                finally: release_conn(conn)
                     
         elif data.startswith('endtrade_'):
             symbol = data.split('_', 1)[1]
@@ -133,21 +135,17 @@ class TelegramListener:
             else:
                 from modules.execution import close_position
                 from modules.database import get_conn, release_conn, get_dict_cursor
-                success, msg = close_position(self.exchange, symbol)
+                success, msg_response = close_position(self.exchange, symbol)
                 if success:
-                    reply = f"✅ {msg}"
-                    # Update DB
+                    reply = f"✅ <b>{msg_response}</b>"
                     conn = get_conn()
                     try:
                         cur = get_dict_cursor(conn)
-                        cur.execute("UPDATE trades SET status = 'Closed (Manual)' WHERE symbol = %s AND status NOT LIKE '%Closed%'", (symbol,))
+                        cur.execute("UPDATE trades SET status = 'Closed (Manual)' WHERE symbol = ? AND status NOT LIKE '%Closed%'", (symbol,))
                         conn.commit()
-                    except Exception as e:
-                        print(f"Error updating DB on manual close: {e}")
-                    finally:
-                        release_conn(conn)
-                else:
-                    reply = f"❌ {msg}"
+                    except: pass
+                    finally: release_conn(conn)
+                else: reply = f"❌ {msg_response}"
                     
         elif data == 'confirmreset_true':
             from modules.database import get_conn, release_conn
@@ -155,12 +153,11 @@ class TelegramListener:
             try:
                 cur = conn.cursor()
                 cur.execute("DELETE FROM trades")
+                cur.execute("DELETE FROM active_trades")
                 conn.commit()
-                reply = "✅ **SUKSES!** Seluruh data screening dan histori posisi lama di database telah berhasil dibersihkan."
-            except Exception as e:
-                reply = f"❌ Gagal mereset database: {e}"
-            finally:
-                release_conn(conn)
+                reply = "✅ **SUCCESS!** Entire history pipeline has been completely wiped from SQLite DB."
+            except Exception as e: reply = f"❌ Failed to wipe db: {e}"
+            finally: release_conn(conn)
                     
         if reply and chat_id:
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
@@ -172,35 +169,46 @@ class TelegramListener:
     def handle_command(self, text, chat_id):
         parts = text.split()
         cmd = parts[0].lower()
-        
         reply = ""
-        if cmd == '/setcapital' and len(parts) > 1:
+        
+        if cmd == '/cex' and len(parts) > 1:
+            val = parts[1].lower()
+            if val in ['binance', 'bitget', 'bybit']:
+                if set_active_cex(val):
+                    from modules.exchange_manager import get_current_exchange
+                    self.exchange = get_current_exchange(force_reload=True) 
+                    reply = f"✅ **Platform Switched Successfully**\nBot is now scanning and trading entirely on **{val.upper()}**.\n*(Note: Make sure your keys are mapped in config.json)*"
+                else: reply = "❌ Failed to update active CEX in DB."
+            else: reply = "❌ Invalid platform. Provide `bybit`, `binance`, or `bitget`."
+            
+        elif cmd == '/setcapital' and len(parts) > 1:
             try:
                 val = float(parts[1])
                 if set_risk_config('total_trading_capital_usdt', val):
-                    reply = f"✅ Modal Total Trading berhasil diatur ke: **${val}**"
-            except: reply = "❌ Format salah. Contoh: /setcapital 10"
+                    reply = f"✅ Trading Capital Set To: **${val}**"
+            except: reply = "❌ Format error. Example: /setcapital 10"
             
-        elif cmd == '/setkuota' and len(parts) > 1:
+        elif cmd == '/setquota' and len(parts) > 1:
             try:
                 val = int(parts[1])
                 if set_risk_config('max_concurrent_trades', val):
-                    reply = f"✅ Maksimal Koin Bersamaan berhasil diatur ke: **{val}** koin"
-            except: reply = "❌ Format salah. Contoh: /setkuota 2"
+                    reply = f"✅ Maximum Concurrent Pair Set To: **{val}** pairs"
+            except: reply = "❌ Format error. Example: /setquota 2"
             
         elif cmd == '/autotrade' and len(parts) > 1:
             val = parts[1].lower()
             if val in ['on', 'off']:
                 if set_risk_config('auto_trade', val):
-                    reply = f"✅ Auto Trade otomatis **{'DIHIDUPKAN' if val == 'on' else 'DIMATIKAN'}**"
-            else: reply = "❌ Format salah. Contoh: /autotrade on"
+                    reply = f"✅ Auto Trade Mode **{'ENABLED' if val == 'on' else 'DISABLED'}**"
+            else: reply = "❌ Format error. Example: /autotrade on"
             
         elif cmd == '/statusrisk':
             cfg = get_risk_config()
-            reply = f"📊 **STATUS RISK & MODAL** 📊\n\n"
+            reply = f"📊 **RISK MANAGER STATUS** 📊\n\n"
+            reply += f"🏢 Current Node: **{get_active_cex().upper()}**\n"
             reply += f"🤖 Auto Trade: **{'ON' if cfg['auto_trade'] else 'OFF'}**\n"
-            reply += f"💰 Modal Total: **${cfg['total_trading_capital_usdt']}**\n"
-            reply += f"🛑 Limit Koin Bersamaan: **{cfg['max_concurrent_trades']}** koin"
+            reply += f"💰 Trading Pool: **${cfg['total_trading_capital_usdt']}**\n"
+            reply += f"🛑 Slot Ceiling: **{cfg['max_concurrent_trades']}** active pairs"
             
         elif cmd == '/live':
             from modules.database import get_conn, release_conn, get_dict_cursor
@@ -215,16 +223,14 @@ class TelegramListener:
                     if isinstance(t_val, str) and len(t_val) >= 16: return t_val[11:16]
                     return str(t_val)
                 lines = [f"`{fmt_time(t['entry_hit_at'] or t['created_at'])}` {'🟢' if 'Active' in t['status'] else '⏳'} **{t['symbol'].split(':')[0]}** ({t['side']}): {t['status']}" for t in trades]
-            except Exception as e:
-                reply = f"❌ Error fetching DB live status: {e}"
-            finally:
-                release_conn(conn)
+            except Exception as e: reply = f"❌ Error fetching DB: {e}"
+            finally: release_conn(conn)
             
-            if lines:
-                text_lines = "\n".join(lines)
-                reply = "<b>📊 LIVE DASHBOARD (DB)</b>\n\n" + text_lines
-            elif not reply:
-                reply = "<b>📊 LIVE DASHBOARD (DB)</b>\n\n⚪ Tidak ada trade aktif/pending di Database."
+            if lines: 
+                block = "\n".join(lines)
+                reply = f"<b>📊 LIVE DASHBOARD (DB)</b>\n\n<pre>{block}</pre>"
+            elif not reply: 
+                reply = "<b>📊 LIVE DASHBOARD (DB)</b>\n\n<pre>⚪ No active or pending trades mapped.</pre>"
             
         elif cmd == '/scan':
             import threading
@@ -232,7 +238,7 @@ class TelegramListener:
                 import main
                 import requests
                 url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-                res = requests.post(url, json={'chat_id': chat_id, 'text': '⏳ Menyiapkan pemindai pasar...', 'parse_mode': 'Markdown'}).json()
+                res = requests.post(url, json={'chat_id': chat_id, 'text': '⏳ Firing algorithm scan cycle...', 'parse_mode': 'Markdown'}).json()
                 msg_id = None
                 if res.get('ok'): msg_id = res['result']['message_id']
                 
@@ -240,91 +246,74 @@ class TelegramListener:
                     if msg_id:
                         e_url = f"https://api.telegram.org/bot{self.token}/editMessageText"
                         requests.post(e_url, json={'chat_id': chat_id, 'message_id': msg_id, 'text': text, 'parse_mode': 'Markdown'})
-                    
-                try:
-                    main.scan(prog_cb)
-                except Exception as e:
-                    prog_cb(f"❌ Error: {e}")
-                    
+                try: main.scan(prog_cb)
+                except Exception as e: prog_cb(f"❌ System Fault: {e}")
             threading.Thread(target=run_manual_scan, daemon=True).start()
-            return # reply handled locally
+            return
             
         elif cmd == '/pending':
-            if not self.exchange:
-                reply = "❌ Exchange is not initialized."
+            if not self.exchange: reply = "❌ Exchange architecture empty."
             else:
                 try:
                     open_orders = self.exchange.fetch_open_orders()
-                    if not open_orders:
-                        reply = "⚪ Tidak ada pending order di Bybit."
+                    if not open_orders: reply = f"⚪ No active limit queues on {get_active_cex().title()}"
                     else:
-                        reply = "⏳ **DAFTAR PENDING ORDER (BYBIT)** ⏳\n\n"
+                        block = ""
                         for o in open_orders:
                             sym = o['symbol'].split(':')[0]
                             side = o['side'].upper()
                             qty = o['amount']
                             price = o['price']
-                            reply += f"⏱ **{sym}** ({side})\n"
-                            reply += f"   • Qty: `{qty}`\n"
-                            reply += f"   • Price: `{price}`\n\n"
-                            if len(reply) > 3500:
-                                reply += "...(Daftar kepanjangan, terpotong)..."
+                            block += f"{sym} ({side})\n"
+                            block += f" ├ Size: {qty}\n └ Bid : {price}\n\n"
+                            if len(block) > 3500:
+                                block += "...(Truncated)...\n"
                                 break
-                except Exception as e:
-                    reply = f"❌ Gagal mengambil perintah pending: {e}"
+                        reply = f"⏳ <b>BROKER QUEUE ({get_active_cex().title()})</b> ⏳\n\n<pre>{block}</pre>"
+                except Exception as e: reply = f"❌ Fetch limits failed: {e}"
             
         elif cmd == '/reset':
-            keyboard = [[{"text": "⚠️ YA, HAPUS SEMUA DATA", "callback_data": "confirmreset_true"}]]
+            keyboard = [[{"text": "⚠️ PROCEED WIPE", "callback_data": "confirmreset_true"}]]
             import json
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            requests.post(url, json={
-                'chat_id': chat_id, 
-                'text': "Apakah Anda amat yakin ingin **menghapus SELURUH histori trade & antrean screening** di database?\n\n*Tindakan ini tidak bisa dibatalkan.*", 
-                'parse_mode': 'Markdown',
-                'reply_markup': json.dumps({"inline_keyboard": keyboard})
-            })
+            requests.post(url, json={'chat_id': chat_id, 'text': "⚠️ **CRITICAL WARNING:** This completely purges screening arrays and position DB histories.\n\n*Action is irreversible.*", 'parse_mode': 'Markdown', 'reply_markup': json.dumps({"inline_keyboard": keyboard})})
             return
             
         elif cmd == '/status':
-            if not self.exchange:
-                reply = "❌ Exchange is not initialized."
+            if not self.exchange: reply = "❌ Exchange engine disjointed."
             else:
                 try:
                     positions = self.exchange.fetch_positions()
                     active_pos = [p for p in positions if float(p.get('contracts', 0)) > 0]
-                    
-                    if not active_pos:
-                        reply = "⚪ Tidak ada posisi yang aktif saat ini."
+                    if not active_pos: reply = f"⚪ Zero exposure on {get_active_cex().title()}"
                     else:
-                        reply = "🟢 **DAFTAR POSISI AKTIF** 🟢\n\n"
+                        reply = f"🟢 <b>MARKET POSITIONS ({get_active_cex().title()})</b> 🟢\n\n"
                         keyboard = []
                         for p in active_pos:
                             sym = p['symbol']
                             side = p['side'].upper()
-                            qty = p['contracts']
-                            pnl = p.get('unrealizedPnl', 0)
-                            if pnl is None: pnl = 0
-                            icon = "🟩" if float(pnl) > 0 else "🟥"
+                            qty = float(p.get('contracts', 0))
+                            pnl = float(p.get('unrealizedPnl', 0) or 0)
+                            entry_price = float(p.get('entryPrice', 1))
                             
-                            reply += f"{icon} **{sym}** ({side})\n"
-                            reply += f"   • Qty: `{qty}`\n"
-                            reply += f"   • Entry: `{p.get('entryPrice', 0)}`\n"
-                            reply += f"   • UPL: `${float(pnl):.2f}`\n\n"
-                            
-                            keyboard.append([{"text": f"🛑 End {sym}", "callback_data": f"endtrade_{sym}"}])
-                            
+                            # Estimate percentage PnL if not provided natively
+                            pct = float(p.get('percentage', 0) or 0)
+                            if pct == 0 and qty > 0 and entry_price > 0:
+                                margin_est = (qty * entry_price) / 25  # Rough approx if leverage is unknown
+                                pct = (pnl / margin_est * 100) if margin_est > 0 else 0
+                                
+                            icon = "🟩" if pnl > 0 else "🟥"
+                            reply += f"{icon} <b>{sym}</b> (<code>{side}</code>)\n"
+                            reply += f"   • Margin: <code>{qty}</code>\n"
+                            reply += f"   • B. Entry: <code>{entry_price}</code>\n"
+                            reply += f"   • Est uNL: <code>${pnl:.2f} ({pct:.2f}%)</code>\n\n"
+                            keyboard.append([{"text": f"🛑 Kill {sym}", "callback_data": f"endtrade_{sym}"}])
                         import json
                         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-                        requests.post(url, json={
-                            'chat_id': chat_id, 
-                            'text': reply, 
-                            'parse_mode': 'Markdown',
-                            'reply_markup': json.dumps({"inline_keyboard": keyboard})
-                        })
-                        return # Reply handled
-                except Exception as e:
-                    reply = f"❌ Gagal mengambil status posisi: {e}"
+                        requests.post(url, json={'chat_id': chat_id, 'text': reply, 'parse_mode': 'Markdown', 'reply_markup': json.dumps({"inline_keyboard": keyboard})})
+                        return 
+                except Exception as e: reply = f"❌ Socket link fault: {e}"
             
         if reply:
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            requests.post(url, json={'chat_id': chat_id, 'text': reply, 'parse_mode': 'Markdown'})
+            requests.post(url, json={'chat_id': chat_id, 'text': reply, 'parse_mode': 'HTML'})

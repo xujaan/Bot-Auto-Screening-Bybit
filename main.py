@@ -12,15 +12,16 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from modules.config_loader import CONFIG
 from modules.database import init_db, get_active_signals
-from modules.technicals import get_technicals, detect_divergence
+from modules.technicals import get_technicals, detect_divergence, check_volatility_squeeze, detect_regime
 from modules.quant import calculate_metrics, check_fakeout
 from modules.derivatives import analyze_derivatives
 from modules.smc import analyze_smc
 from modules.patterns import find_pattern
 from modules.bot import send_alert, update_status_dashboard, run_fast_update, send_scan_completion
 
-exchange = ccxt.bybit({'apiKey': CONFIG['api']['bybit_key'], 'secret': CONFIG['api']['bybit_secret'], 'options': {'defaultType': 'swap'}})
+from modules.exchange_manager import get_current_exchange
 
+exchange = get_current_exchange()
 def get_btc_bias():
     try:
         bars = exchange.fetch_ohlcv('BTC/USDT', '1d', limit=100)
@@ -37,7 +38,7 @@ def calculate_rr(entry, sl, tp3):
     risk = abs(entry - sl)
     return round(abs(tp3 - entry) / risk, 2) if risk > 0 else 0.0
 
-def analyze_ticker(symbol, timeframe, btc_bias, active_signals):
+def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache):
     # 1. DUPLICATE CHECK
     if (symbol, timeframe) in active_signals: return None
     
@@ -77,8 +78,36 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals):
         # 5. Scores & Bias
         div_score, div_msg = detect_divergence(df)
         tech_score = 3 + div_score
+        
+        regime = detect_regime(df)
+        is_squeezing, squeeze_firing = check_volatility_squeeze(df)
+        
+        # -- Phase B: MTC Logic --
+        if timeframe in ['1w', '1d', '4h']:
+            macro_cache[symbol] = regime
+        else:
+            macro_regime = macro_cache.get(symbol)
+            if macro_regime == "Trending Bull" and side == "Short": return None
+            if macro_regime == "Trending Bear" and side == "Long": return None
+            if macro_regime: tech_reasons.append(f"MTC Aligned")
+            
         tech_reasons = [f"Pattern: {pattern}", div_msg] + smc_reasons
+        if squeeze_firing: 
+            tech_score += 2
+            tech_reasons.append("💥 Squeeze Firing")
+        elif is_squeezing: 
+            tech_score += 1
+            tech_reasons.append("🗜️ Squeeze ON")
+            
+        if regime == "Trending Bull":
+            if side == "Long": tech_score += 1
+            else: return None # Strict trend alignment
+        elif regime == "Trending Bear":
+            if side == "Short": tech_score += 1
+            else: return None # Strict trend alignment
 
+        tech_reasons.append(f"Regime: {regime}")
+        
         total_score = tech_score + smc_score + quant_score + deriv_score
         
         if "Bearish" in btc_bias and side == "Long": return None
@@ -110,12 +139,14 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals):
         df['funding'] = float(ticker_info.get('info', {}).get('fundingRate', 0))
         
         # 7. Return Data (Type Casted)
+        natr_val = df['NATR_14'].iloc[-1] if 'NATR_14' in df.columns else 0.0
         return {
             "Symbol": symbol, "Side": side, "Timeframe": timeframe, "Pattern": pattern,
             "Entry": float(entry), "SL": float(sl), "TP1": float(tp1), "TP2": float(tp2), "TP3": float(tp3), "RR": float(rr),
             "Tech_Score": int(tech_score), "Quant_Score": int(quant_score), 
             "Deriv_Score": int(deriv_score), "SMC_Score": int(smc_score),
             "Basis": float(basis), "Z_Score": float(z_score), "Zeta_Score": float(zeta_score), "OBI": float(obi),
+            "NATR": float(natr_val),
             "BTC_Bias": btc_bias, "Reason": pattern, 
             "Tech_Reasons": ", ".join(tech_reasons),
             "Quant_Reasons": ", ".join(quant_reasons),
@@ -128,6 +159,12 @@ def scan(progress_callback=None):
     start_time = time.time()
     msg = f"\n[{pd.Timestamp.now()}] 🔭 Scanning... Mode: {os.getenv('BOT_ENV', 'PROD')}"
     print(msg)
+    
+    global exchange
+    exchange = get_current_exchange(force_reload=True)
+    platform = exchange.id if exchange else "Unknown"
+    print(f"🏢 Active CEX: {platform.upper()}")
+    
     btc_bias = get_btc_bias()
     print(f"📊 BTC Bias: {btc_bias}")
     
@@ -149,13 +186,14 @@ def scan(progress_callback=None):
         # 1. Must be a Swap (Perpetual)
         # 2. Quote currency must be USDT
         # 3. Must be Active (trading enabled)
-        # 4. Base currency MUST NOT be a stablecoin
+        # Base currency MUST NOT be a stablecoin
+        # Different exchanges might report quote differently
         syms = [
             s for s in mkts 
-            if mkts[s].get('swap') 
-            and mkts[s]['quote'] == 'USDT' 
-            and mkts[s].get('active')
-            and mkts[s]['base'] not in STABLECOINS # <--- STABLECOIN FILTER
+            if mkts[s].get('swap') or mkts[s].get('future') or mkts[s].get('linear')
+            and mkts[s].get('quote') == 'USDT' 
+            and mkts[s].get('active', True)
+            and mkts[s].get('base') not in STABLECOINS
         ]
         
         random.shuffle(syms) 
@@ -164,11 +202,13 @@ def scan(progress_callback=None):
         print(f"🔍 Scanning {c} valid pairs (Stables removed)...")
 
         tfs = CONFIG['system']['timeframes']
+        macro_cache = {} # MTC Phase cache
+        
         for i, tf in enumerate(reversed(tfs)):
             if progress_callback: progress_callback(f"⏳ **Menganalisa Timeframe {tf}** ({i+1}/{len(tfs)})\nMemindai {c} koin secara paralel...")
             scan_results = []
             with ThreadPoolExecutor(max_workers=CONFIG['system']['max_threads']) as ex:
-                futures = [ex.submit(analyze_ticker, s, tf, btc_bias, active_signals) for s in syms]
+                futures = [ex.submit(analyze_ticker, s, tf, btc_bias, active_signals, macro_cache) for s in syms]
                 for f in as_completed(futures):
                     res = f.result()
                     if res: scan_results.append(res)

@@ -53,8 +53,8 @@ def execute_entry(exchange, res):
     qty = float(qty_str)
     price_str = exchange.price_to_precision(symbol, entry_price)
     
-    if qty < market['limits']['amount']['min']:
-        print(f"❌ Order {symbol} gagal: Qty {qty} kurang dari minimum Bybit {market['limits']['amount']['min']}")
+    if qty <= 0:
+        print(f"❌ Order {symbol} failed: Qty is zero or too small")
         return False
         
     print(f"🚀 (Auto-Trade) LIMIT Order {symbol} | Mgn: ${margin_per_trade:.2f} | Lev: {leverage}x | Qty: {qty} | Entry: {price_str}")
