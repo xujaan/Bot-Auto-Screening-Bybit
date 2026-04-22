@@ -78,7 +78,7 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache):
         
         # 5. Scores & Bias
         div_score, div_msg = detect_divergence(df)
-        tech_score = 4 + div_score # Base score 4 (needs +1 to hit min 5)
+        tech_score = 5 + div_score # Base score 5. Will pass natively, but drop to 4 (fail) if explicitly counter-trend!
         
         regime = detect_regime(df)
         is_squeezing, squeeze_firing = check_volatility_squeeze(df)
