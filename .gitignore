@@ -7,4 +7,4 @@ venv
 .rtk
 .venv
 **/__pycache__/
-futurabot.sqlite
+*.sqlite

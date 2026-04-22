@@ -48,7 +48,8 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache):
         if "ST" in ticker_info.get('info', {}).get('symbol', ''): return None
         
         min_candles = CONFIG['system'].get('min_candles_analysis', 150)
-        bars = exchange.fetch_ohlcv(symbol, timeframe, limit=min_candles + 50)
+        # Fetching extra 200 bars as warmup padding for SMA_200 before dropna wipes them
+        bars = exchange.fetch_ohlcv(symbol, timeframe, limit=min_candles + 200)
         if not bars or len(bars) < min_candles: return None
             
         df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
@@ -285,6 +286,6 @@ if __name__ == "__main__":
     tg_listener = TelegramListener(exchange=exchange)
     tg_listener.start()
     
-    print("🚀 Bot Started. Holding for manual Telegram triggers.")
+    print("🚀 Bot Started. type /start to start autoscan.")
     while True: 
         time.sleep(1)
