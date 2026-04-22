@@ -193,7 +193,7 @@ def scan(progress_callback=None):
         # Different exchanges might report quote differently
         syms = [
             s for s in mkts 
-            if mkts[s].get('swap') or mkts[s].get('future') or mkts[s].get('linear')
+            if (mkts[s].get('swap') or mkts[s].get('future') or mkts[s].get('linear'))
             and mkts[s].get('quote') == 'USDT' 
             and mkts[s].get('active', True)
             and mkts[s].get('base') not in STABLECOINS
@@ -209,10 +209,14 @@ def scan(progress_callback=None):
         
         for i, tf in enumerate(reversed(tfs)):
             if SCAN_ABORT_FLAG: break
-            if progress_callback: progress_callback(f"⏳ **Analyzing Timeframe {tf}** ({i+1}/{len(tfs)})\nScanning {c} valid pairs...")
             scan_results = []
-            for s in syms:
+            for s_idx, s in enumerate(syms):
                 if SCAN_ABORT_FLAG: break
+                
+                # Real-time progress update every 20 pairs (~3 seconds) to prevent TG rate limit
+                if s_idx % 20 == 0 and progress_callback:
+                    progress_callback(f"⏳ **Analyzing Timeframe {tf}** ({i+1}/{len(tfs)})\nScanning: {s_idx}/{c} pairs... (`{s}`)")
+                    
                 try:
                     res = analyze_ticker(s, tf, btc_bias, active_signals, macro_cache)
                     if res: scan_results.append(res)
