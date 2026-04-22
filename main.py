@@ -11,6 +11,7 @@ import numpy as np
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 SCAN_ABORT_FLAG = False
+AUTOSCAN_ENABLED = False
 from modules.config_loader import CONFIG
 from modules.database import init_db, get_active_signals
 from modules.technicals import get_technicals, detect_divergence, check_volatility_squeeze, detect_regime
@@ -288,4 +289,21 @@ if __name__ == "__main__":
     
     print("🚀 Bot Started. type /start to start autoscan.")
     while True: 
-        time.sleep(1)
+        if AUTOSCAN_ENABLED:
+            try:
+                print("🔄 Running AutoScan cycle...")
+                SCAN_ABORT_FLAG = False
+                scan()
+                
+                if AUTOSCAN_ENABLED and not SCAN_ABORT_FLAG:
+                    interval = CONFIG['system'].get('check_interval_hours', 1)
+                    print(f"💤 Scan finished. Sleeping for {interval} hours.")
+                    sleep_secs = int(interval * 3600)
+                    for _ in range(sleep_secs):
+                        if not AUTOSCAN_ENABLED or SCAN_ABORT_FLAG: break
+                        time.sleep(1)
+            except Exception as e:
+                print(f"❌ Autoscan Error: {e}")
+                time.sleep(60)
+        else:
+            time.sleep(1)

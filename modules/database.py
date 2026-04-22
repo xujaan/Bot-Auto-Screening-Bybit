@@ -184,7 +184,7 @@ def get_active_signals():
 def get_risk_config():
     conn = get_conn()
     defaults = {
-        'auto_trade': 'on',
+        'auto_trade': 'off',
         'total_trading_capital_usdt': '10.0',
         'max_concurrent_trades': '2',
         'max_leverage_limit': '50'
@@ -200,7 +200,7 @@ def get_risk_config():
     except: pass
     finally: release_conn(conn)
     return {
-        'auto_trade': defaults.get('auto_trade', 'on') == 'on',
+        'auto_trade': defaults.get('auto_trade', 'off') == 'on',
         'total_trading_capital_usdt': float(defaults.get('total_trading_capital_usdt', 10)),
         'max_concurrent_trades': int(defaults.get('max_concurrent_trades', 2)),
         'max_leverage_limit': int(defaults.get('max_leverage_limit', 50))

@@ -115,7 +115,14 @@ class TelegramListener:
         @self.bot.message_handler(commands=['scan'])
         def cmd_scan(message):
             import main
-            sent_msg = self.safesend_sync(message.chat.id, "⏳ Firing algorithm scan cycle...")
+            if main.AUTOSCAN_ENABLED:
+                main.AUTOSCAN_ENABLED = False
+                main.SCAN_ABORT_FLAG = True
+                sent_msg = self.safesend_sync(message.chat.id, "⚠️ **Autoscan Disabled & Aborted.** Firing manual scan in 2 seconds...")
+                time.sleep(2)
+            else:
+                sent_msg = self.safesend_sync(message.chat.id, "⏳ Firing manual algorithm scan cycle...")
+            main.SCAN_ABORT_FLAG = False
             
             def prog_cb(text):
                 if sent_msg:
@@ -133,11 +140,38 @@ class TelegramListener:
                 except Exception as e: prog_cb(f"❌ System Fault: {e}")
             threading.Thread(target=run_manual_scan, daemon=True).start()
 
+        @self.bot.message_handler(commands=['start'])
+        def cmd_start(message):
+            import main
+            if main.AUTOSCAN_ENABLED:
+                self.safesend(message.chat.id, "⚠️ **Autoscan is already running.**")
+            else:
+                main.AUTOSCAN_ENABLED = True
+                main.SCAN_ABORT_FLAG = False
+                self.safesend(message.chat.id, "✅ **Autoscan STARTED.**\nBot will now scan continuously automatically.\nType /stop to halt it.")
+
         @self.bot.message_handler(commands=['stop'])
         def cmd_stop(message):
             import main
+            main.AUTOSCAN_ENABLED = False
             main.SCAN_ABORT_FLAG = True
-            self.safesend(message.chat.id, "🛑 **Abort Signal Sent.** Any active scans will halt instantly.")
+            self.safesend(message.chat.id, "🛑 **Autoscan STOPPED & Abort Signal Sent.** Any active scans will halt instantly.")
+            
+        @self.bot.message_handler(commands=['autoscan'])
+        def cmd_autoscan(message):
+            import main
+            parts = message.text.split()
+            if len(parts) > 1:
+                val = parts[1].lower()
+                if val == 'on':
+                    cmd_start(message)
+                elif val == 'off':
+                    cmd_stop(message)
+                else:
+                    self.safesend(message.chat.id, "❌ Usage: /autoscan on|off")
+            else:
+                state = "ON" if main.AUTOSCAN_ENABLED else "OFF"
+                self.safesend(message.chat.id, f"🔄 Autoscan is currently **{state}**.\nUsage: /autoscan on|off")
 
         @self.bot.message_handler(commands=['pending'])
         def cmd_pending(message):
@@ -403,6 +437,8 @@ class TelegramListener:
                 telebot.types.BotCommand("balance", "Check unified balance & exposure"),
                 telebot.types.BotCommand("live", "Show DB live dashboard & pending signals"),
                 telebot.types.BotCommand("pending", "Retrieve limit orders queue in Exchange"),
+                telebot.types.BotCommand("start", "Start Continuous Auto-Scan loop"),
+                telebot.types.BotCommand("autoscan", "Toggle Auto-Scan ON/OFF"),
                 telebot.types.BotCommand("scan", "Force manual market scan instantly"),
                 telebot.types.BotCommand("stop", "Abort any active screening sequence"),
                 telebot.types.BotCommand("fav", "View favorite saved signals"),
