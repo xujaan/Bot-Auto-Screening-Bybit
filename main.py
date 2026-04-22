@@ -186,14 +186,14 @@ def scan(progress_callback=None):
         STABLECOINS = ['USDC', 'USDT', 'DAI', 'FDUSD', 'USDD', 'USDE', 'TUSD', 'BUSD', 'PYUSD', 'USDS', 'EUR', 'USD']
 
         # Filter Logic:
-        # 1. Must be a Swap (Perpetual)
+        # 1. Must be a Perpetual Swap (type == 'swap' and swap == True)
         # 2. Quote currency must be USDT
         # 3. Must be Active (trading enabled)
-        # Base currency MUST NOT be a stablecoin
-        # Different exchanges might report quote differently
+        # 4. Base currency MUST NOT be a stablecoin
         syms = [
             s for s in mkts 
-            if (mkts[s].get('swap') or mkts[s].get('future') or mkts[s].get('linear'))
+            if mkts[s].get('swap') == True
+            and mkts[s].get('type') == 'swap'
             and mkts[s].get('quote') == 'USDT' 
             and mkts[s].get('active', True)
             and mkts[s].get('base') not in STABLECOINS

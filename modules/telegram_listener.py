@@ -133,6 +133,12 @@ class TelegramListener:
                 except Exception as e: prog_cb(f"❌ System Fault: {e}")
             threading.Thread(target=run_manual_scan, daemon=True).start()
 
+        @self.bot.message_handler(commands=['stop'])
+        def cmd_stop(message):
+            import main
+            main.SCAN_ABORT_FLAG = True
+            self.safesend(message.chat.id, "🛑 **Abort Signal Sent.** Any active scans will halt instantly.")
+
         @self.bot.message_handler(commands=['pending'])
         def cmd_pending(message):
             if not self.exchange: reply = "❌ Exchange architecture empty."
@@ -398,6 +404,7 @@ class TelegramListener:
                 telebot.types.BotCommand("live", "Show DB live dashboard & pending signals"),
                 telebot.types.BotCommand("pending", "Retrieve limit orders queue in Exchange"),
                 telebot.types.BotCommand("scan", "Force manual market scan instantly"),
+                telebot.types.BotCommand("stop", "Abort any active screening sequence"),
                 telebot.types.BotCommand("fav", "View favorite saved signals"),
                 telebot.types.BotCommand("log", "View system activity logs"),
                 telebot.types.BotCommand("reset", "Erase screening histories from database"),
