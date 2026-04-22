@@ -30,8 +30,8 @@
     "fib_tp_3": 2.618
   },
   "strategy": {
-    "min_tech_score": 3,
-    "min_quant_score": 2,
+    "min_tech_score": 4,
+    "min_quant_score": 3,
     "risk_reward_min": 2.0
   },
   "indicators": {
