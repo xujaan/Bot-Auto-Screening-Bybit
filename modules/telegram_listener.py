@@ -260,18 +260,30 @@ class TelegramListener:
             conn = get_conn()
             try:
                 cur = get_dict_cursor(conn)
-                cur.execute("SELECT symbol, side, timeframe, pattern, entry_price FROM favorites_list ORDER BY added_at DESC LIMIT 15")
+                cur.execute("SELECT id, symbol, side, timeframe, pattern, entry_price FROM favorites_list ORDER BY added_at DESC LIMIT 10")
                 favs = cur.fetchall()
-                if not favs: reply = "⚪ You have no favorites saved."
-                else:
-                    block = ""
-                    for f in favs:
-                        block += f"⭐ {f['symbol']} ({f['side']})\n"
-                        block += f" ├ TF: {f['timeframe']} [{f['pattern']}]\n └ Entry: {f['entry_price']}\n\n"
-                    reply = f"🌟 **SAVED FAVORITES** 🌟\n\n```text\n{block}\n```"
-            except Exception as e: reply = f"❌ Fetch favorites failed: {e}"
+                if not favs: 
+                    self.safesend(message.chat.id, "⚪ **You have no favorites saved.**\nUse the ⭐ button on any signal to save it here.")
+                    return
+                
+                self.safesend(message.chat.id, "🌟 **SAVED FAVORITES (Latest 10)** 🌟")
+                
+                for f in favs:
+                    emoji = "🚀" if f['side'] == 'Long' else "🔻"
+                    text = f"{emoji} **{f['symbol']}** ({f['side']})\n"
+                    text += f"├ 🛠️ **TF:** `{f['timeframe']}`\n"
+                    text += f"├ 🔍 **Pattern:** `{f['pattern']}`\n"
+                    text += f"└ 🎯 **Entry:** `{f['entry_price']}`"
+                    
+                    markup = InlineKeyboardMarkup()
+                    btn_trade = InlineKeyboardButton("🚀 Execute", callback_data=f"trade_{f['symbol']}")
+                    btn_del = InlineKeyboardButton("🗑️ Remove", callback_data=f"unfav_{f['id']}")
+                    markup.row(btn_trade, btn_del)
+                    
+                    self.bot.send_message(message.chat.id, telegramify_markdown.markdownify(text), parse_mode='MarkdownV2', reply_markup=markup)
+                    
+            except Exception as e: self.safesend(message.chat.id, f"❌ Fetch favorites failed: {e}")
             finally: release_conn(conn)
-            self.safesend(message.chat.id, reply)
 
         @self.bot.message_handler(commands=['status'])
         def cmd_status(message):
@@ -402,9 +414,9 @@ class TelegramListener:
                                 )
                                 try:
                                     cur.execute("""
-                                        INSERT INTO active_trades (signal_id, symbol, side, entry_price, sl_price, tp1, tp2, tp3, quantity, leverage, order_id, status)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
-                                    """, (trade['id'], result['symbol'], trade['side'], result['entry_price'], result['sl'], trade['tp1'], trade['tp2'], trade['tp3'], result['qty'], result['leverage'], result['order_id']))
+                                        INSERT INTO active_trades (signal_id, symbol, side, entry_price, sl_price, tp1, tp2, tp3, quantity, leverage, order_id, status, strategy, grid_max_layers, avg_entry_price)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?)
+                                    """, (trade['id'], result['symbol'], trade['side'], result['entry_price'], result['sl'], result['tp1'], result['tp2'], result['tp3'], result['qty'], result['leverage'], result['order_id'], result['strategy'], result['grid_max'], result['entry_price']))
                                     conn.commit()
                                 except Exception as e: print(f"Active trades insert err: {e}")
                             else: reply = f"❌ Failed to place order for {symbol}."
@@ -462,6 +474,36 @@ class TelegramListener:
             
             if reply: self.safesend(call.message.chat.id, reply)
             self.bot.answer_callback_query(call.id)
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith('unfav_'))
+        def call_unfav(call):
+            fav_id = call.data.split('_')[1]
+            from modules.database import get_conn, release_conn
+            conn = get_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM favorites_list WHERE id = ?", (fav_id,))
+                conn.commit()
+                self.bot.delete_message(call.message.chat.id, call.message.message_id)
+                self.bot.answer_callback_query(call.id, "✅ Removed from favorites.")
+            except Exception as e: 
+                self.bot.answer_callback_query(call.id, f"❌ Error: {e}")
+            finally: release_conn(conn)
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith('jump_'))
+        def call_jump(call):
+            m_id = call.data.split('_')[1]
+            try:
+                # Reply to the target message to create a "jump" link in the header
+                self.bot.send_message(
+                    call.message.chat.id, 
+                    "📍 **Found it!** Click the header of this message to jump up 👆", 
+                    reply_to_message_id=m_id,
+                    parse_mode='Markdown'
+                )
+                self.bot.answer_callback_query(call.id)
+            except Exception as e:
+                self.bot.answer_callback_query(call.id, "❌ Message too old or not found.")
 
         @self.bot.callback_query_handler(func=lambda call: call.data == 'confirmreset_true')
         def call_confirmreset(call):

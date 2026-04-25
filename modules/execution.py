@@ -11,13 +11,38 @@ def set_leverage(exchange, symbol, lev):
 
 def execute_entry(exchange, res):
     from modules.database import get_risk_config
+    from modules.config_loader import CONFIG
     risk_cfg = get_risk_config()
     
     symbol = res['Symbol']
     side = 'buy' if res['Side'] == 'Long' else 'sell'
     entry_price = float(res['Entry'])
     sl = float(res['SL'])
+    tf = res.get('Timeframe')
     
+    # --- Strategy Routing ---
+    strategy = 'NORMAL'
+    grid_max = 1
+    tp1 = res.get('TP1')
+    tp2 = res.get('TP2')
+    tp3 = res.get('TP3')
+
+    if tf in ['15m', '1h']:
+        strategy = 'SCALPING'
+        s_cfg = CONFIG.get('scalping_setup', {'tp_percentage': 1.5, 'sl_percentage': 1.0})
+        tp_pct = s_cfg['tp_percentage'] / 100
+        sl_pct = s_cfg['sl_percentage'] / 100
+        if side == 'buy':
+            tp1 = entry_price * (1 + tp_pct)
+            sl = entry_price * (1 - sl_pct)
+        else:
+            tp1 = entry_price * (1 - tp_pct)
+            sl = entry_price * (1 + sl_pct)
+        tp2, tp3 = None, None
+    elif tf in ['4h', '1d', '1w']:
+        strategy = 'GRID'
+        grid_max = CONFIG.get('grid_setup', {}).get('max_layers', 4)
+
     try:
         market = exchange.market(symbol)
     except Exception as e:
@@ -28,19 +53,16 @@ def execute_entry(exchange, res):
     max_trades = risk_cfg['max_concurrent_trades']
     
     total_score = res.get('Total_Score', 6)
-    if total_score >= 9:
-        alloc_scale = 1.0
-    elif total_score >= 7:
-        alloc_scale = 0.75
-    else:
-        alloc_scale = 0.50
+    if total_score >= 9: alloc_scale = 1.0
+    elif total_score >= 7: alloc_scale = 0.75
+    else: alloc_scale = 0.50
         
     margin_per_trade = (total_cap / max_trades) * alloc_scale
     
     # 🌟 Kalkulator Jarak SL ke Leverage Dinamis
     sl_dist_pct = abs(entry_price - sl) / entry_price
-    if sl_dist_pct == 0: sl_dist_pct = 0.01 # Pencegah error
-    dynamic_lev = math.floor(0.90 / sl_dist_pct) # Buffer keamanan 90%
+    if sl_dist_pct == 0: sl_dist_pct = 0.01 
+    dynamic_lev = math.floor(0.90 / sl_dist_pct) 
     leverage = min(dynamic_lev, risk_cfg['max_leverage_limit'])
     leverage = max(1, int(leverage))
 
@@ -54,47 +76,52 @@ def execute_entry(exchange, res):
     price_str = exchange.price_to_precision(symbol, entry_price)
     
     if qty <= 0:
-        print(f"❌ Order {symbol} failed: Qty is zero or too small")
+        print(f"❌ Order {symbol} failed: Qty too small")
         return False
         
-    print(f"🚀 (Auto-Trade) LIMIT Order {symbol} | Mgn: ${margin_per_trade:.2f} | Lev: {leverage}x | Qty: {qty} | Entry: {price_str}")
+    print(f"🚀 (Manual/Auto) {strategy} Order {symbol} | Entry: {price_str}")
     
-    params = {
-        'stopLoss': float(sl)
-    }
-    
-    tp3 = res.get('TP3')
-    tp1 = res.get('TP1')
-    # if tp3:
-    #     params['takeProfit'] = float(tp3)
-    if tp1:
-        params['takeProfit'] = float(tp1)
+    params = {'stopLoss': float(sl)}
+    if tp1: params['takeProfit'] = float(tp1)
         
     try:
         order = exchange.create_order(symbol, 'limit', side, qty_str, price_str, params)
-        print(f"✅ LIMIT Order Entry Sukses! ID: {order.get('id')}")
+        print(f"✅ Entry Sukses! ID: {order.get('id')}")
         
+        if strategy == 'GRID' and order.get('id'):
+            # Place Subsequent Layers
+            g_cfg = CONFIG.get('grid_setup', {'price_step_percentage': 2.5, 'martingale_multiplier': 2.0})
+            price_step = g_cfg['price_step_percentage'] / 100
+            multiplier = g_cfg['martingale_multiplier']
+            curr_p, curr_q = entry_price, qty
+            for i in range(2, grid_max + 1):
+                curr_p = curr_p * (1 - price_step) if side == 'buy' else curr_p * (1 + price_step)
+                curr_q = curr_q * multiplier
+                p_s = exchange.price_to_precision(symbol, curr_p)
+                q_s = exchange.amount_to_precision(symbol, curr_q)
+                try: exchange.create_order(symbol, 'limit', side, q_s, p_s, {'reduceOnly': False})
+                except: pass
+
         mmr = 0.005
-        if side == 'buy':
-            liq_price = entry_price * (1 - 1/leverage + mmr)
-        else:
-            liq_price = entry_price * (1 + 1/leverage - mmr)
+        liq_price = entry_price * (1 - 1/leverage + mmr) if side == 'buy' else entry_price * (1 + 1/leverage - mmr)
             
         return {
             "success": True,
             "order_id": order.get('id', 'N/A'),
             "symbol": symbol,
-            "side": side.upper(),
+            "side": "LONG" if side == 'buy' else "SHORT",
             "margin": margin_per_trade,
-            "total_cap": total_cap,
             "leverage": leverage,
             "qty": qty,
             "entry_price": entry_price,
             "sl": sl,
-            "liq_price": liq_price
+            "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "liq_price": liq_price,
+            "strategy": strategy,
+            "grid_max": grid_max
         }
     except Exception as e:
-        print(f"❌ Gagal mengeksekusi order {symbol}: {e}")
+        print(f"❌ Gagal eksekusi {symbol}: {e}")
         return False
 
 def place_layered_tps(exchange, symbol, pos_side, tp1, tp2, tp3, total_qty):

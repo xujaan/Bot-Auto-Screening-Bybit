@@ -88,6 +88,10 @@ def init_execution_db():
                 is_sl_moved BOOLEAN DEFAULT FALSE,
                 trailing_active BOOLEAN DEFAULT FALSE,
                 trailing_stop_price DECIMAL,
+                strategy VARCHAR(20) DEFAULT 'NORMAL',
+                grid_layer INT DEFAULT 1,
+                grid_max_layers INT DEFAULT 1,
+                avg_entry_price DECIMAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -114,7 +118,7 @@ def init_execution_db():
     finally:
         release_conn(conn)
 
-def place_split_tps(symbol, side, total_qty, tp1, tp2, tp3):
+def place_split_tps(symbol, side, total_qty, tp1, tp2, tp3, strategy='NORMAL'):
     try:
         side_str = str(side).lower()
         tp_side = 'sell' if side_str in ['buy', 'long'] else 'buy'
@@ -122,13 +126,21 @@ def place_split_tps(symbol, side, total_qty, tp1, tp2, tp3):
         exchange = active_engine['exchange']
         if not exchange: return False
         
+        params = {'reduceOnly': True}
+        
+        if strategy in ['SCALPING', 'GRID']:
+            if tp1 is None: return False
+            q_str = exchange.amount_to_precision(symbol, total_qty)
+            p_str = exchange.price_to_precision(symbol, tp1)
+            logger.info(f"⚡ Placing Single TP ({strategy}) for {symbol}: {q_str} @ {p_str}")
+            exchange.create_order(symbol, 'limit', tp_side, q_str, p_str, params)
+            return True
+
+        if tp1 is None or tp2 is None: return False
         q1 = float(exchange.amount_to_precision(symbol, total_qty * TP_SPLIT[0]))
         q2 = float(exchange.amount_to_precision(symbol, total_qty * TP_SPLIT[1]))
         
-        # We NO LONGER limit TP3! We let it trail!
-        params = {'reduceOnly': True}
-        
-        logger.info(f"⚡ Placing TPs for {symbol} ({tp_side.upper()}): {q1} | {q2} | Trailing 40%")
+        logger.info(f"⚡ Placing Split TPs for {symbol} ({tp_side.upper()}): {q1} | {q2} | Trailing 40%")
         
         exchange.create_order(symbol, 'limit', tp_side, q1, float(tp1), params)
         exchange.create_order(symbol, 'limit', tp_side, q2, float(tp2), params)
@@ -147,14 +159,14 @@ def on_execution_update(message):
                 conn = get_conn()
                 try:
                     cur = conn.cursor()
-                    cur.execute("SELECT id, tp1, tp2, tp3 FROM active_trades WHERE symbol = ? AND status = 'OPEN'", (exec_item['symbol'],))
+                    cur.execute("SELECT id, tp1, tp2, tp3, strategy FROM active_trades WHERE symbol = ? AND status = 'OPEN'", (exec_item['symbol'],))
                     row = cur.fetchone()
                     if row:
-                        t_id, tp1, tp2, tp3 = row
+                        t_id, tp1, tp2, tp3, strategy = row
                         pos = active_engine['exchange'].fetch_position(exec_item['symbol'])
                         size = float(pos['contracts'])
                         if size > 0:
-                            if place_split_tps(exec_item['symbol'], exec_item['side'], size, tp1, tp2, tp3):
+                            if place_split_tps(exec_item['symbol'], exec_item['side'], size, tp1, tp2, tp3, strategy=strategy):
                                 cur.execute("UPDATE active_trades SET status = 'OPEN_TPS_SET', updated_at = datetime('now') WHERE id = ?", (t_id,))
                                 conn.commit()
                 except: pass
@@ -164,20 +176,20 @@ def on_execution_update(message):
 def on_position_update(message):
     try:
         data = message.get('data', [])
-        for pos in data:
-            symbol = pos['symbol']
-            size = float(pos['size'])
-            mark_price = float(pos['markPrice'])
-            side = pos['side']
+        for pos_data in data:
+            symbol = pos_data['symbol']
+            size = float(pos_data['size'])
+            mark_price = float(pos_data['markPrice'])
+            side = pos_data['side']
             
             conn = get_conn()
             try:
                 cur = conn.cursor()
-                cur.execute("SELECT id, entry_price, tp1, is_sl_moved, status FROM active_trades WHERE symbol = ? AND status = 'OPEN_TPS_SET'", (symbol,))
+                cur.execute("SELECT id, entry_price, tp1, is_sl_moved, status, strategy, quantity, avg_entry_price FROM active_trades WHERE symbol = ? AND status = 'OPEN_TPS_SET'", (symbol,))
                 row = cur.fetchone()
                 
                 if row:
-                    t_id, entry, tp1, sl_moved, status = row
+                    t_id, entry, tp1, sl_moved, status, strategy, recorded_qty, avg_entry = row
                     
                     if size == 0:
                         logger.info(f"🏁 {symbol} Pos Closed (WS).")
@@ -191,48 +203,78 @@ def on_position_update(message):
                         conn.commit()
                         return
 
-                    hit_tp1 = (side == 'Buy' and mark_price >= float(tp1)) or (side == 'Sell' and mark_price <= float(tp1))
-                    if hit_tp1 and not sl_moved:
-                        logger.info(f"♻️ {symbol} TP1 Hit. BEP...")
+                    # --- GRID LAYER MONITORING (Bybit WS) ---
+                    if strategy == 'GRID' and size > float(recorded_qty) + 0.00001:
+                        # fetch AEP from message or API
+                        new_avg = float(pos_data.get('entryPrice', avg_entry))
+                        g_cfg = CONFIG.get('grid_setup', {'take_profit_percentage': 1.5})
+                        new_tp = new_avg * (1 + g_cfg['take_profit_percentage']/100) if side == 'Buy' else new_avg * (1 - g_cfg['take_profit_percentage']/100)
+                        
+                        logger.info(f"📈 {symbol} Grid Layer Filled (WS). New AEP: {new_avg}")
+                        
                         try:
-                            active_engine['exchange'].set_position_stop_loss(symbol, float(entry), side.lower())
-                            cur.execute("UPDATE active_trades SET is_sl_moved = 1 WHERE id = ?", (t_id,))
-                            conn.commit()
+                            # Cancel old TP
+                            exchange = active_engine['exchange']
+                            open_orders = exchange.fetch_open_orders(symbol)
+                            for oo in open_orders:
+                                if oo.get('reduceOnly') == True:
+                                    exchange.cancel_order(oo['id'], symbol)
+                            
+                            place_split_tps(symbol, side.lower(), size, new_tp, None, None, strategy='GRID')
                         except: pass
+                        
+                        cur.execute("UPDATE active_trades SET quantity = ?, avg_entry_price = ?, tp1 = ?, grid_layer = grid_layer + 1 WHERE id = ?", (size, new_avg, new_tp, t_id))
+                        conn.commit()
+                        recorded_qty, tp1 = size, new_tp
+
+                    if strategy != 'GRID':
+                        hit_tp1 = tp1 and ((side in ['Buy', 'buy'] and mark_price >= float(tp1)) or (side in ['Sell', 'sell'] and mark_price <= float(tp1)))
+                        if hit_tp1 and not sl_moved:
+                            logger.info(f"♻️ {symbol} TP1 Hit. BEP...")
+                            try:
+                                active_engine['exchange'].set_position_stop_loss(symbol, float(entry), side.lower())
+                                cur.execute("UPDATE active_trades SET is_sl_moved = 1 WHERE id = ?", (t_id,))
+                                conn.commit()
+                            except: pass
             except: pass
             finally: release_conn(conn)
     except: pass
 
-
-# --- CCXT POLLING ENGINE (For Binance/Bitget) ---
 def ccxt_poll_positions():
-    """Fallback Poller for CEXs that don't have WebSocket implemented here."""
     exchange = active_engine['exchange']
     if not exchange or active_engine['platform'] == 'bybit': return # Bybit uses WS
     
     conn = get_conn()
     try:
         cur = conn.cursor()
-        
+        # --- CCXT POLLING ENGINE (For Binance/Bitget) ---
         # 1. Manage Entries waiting for TPs ('OPEN')
-        cur.execute("SELECT id, symbol, side, tp1, tp2, tp3 FROM active_trades WHERE status = 'OPEN'")
+        cur.execute("SELECT id, symbol, side, tp1, tp2, tp3, strategy, quantity FROM active_trades WHERE status = 'OPEN'")
         open_trades = cur.fetchall()
         for t in open_trades:
-            t_id, sym, side_str, tp1, tp2, tp3 = t
+            t_id, sym, side_str, tp1, tp2, tp3, strategy, recorded_qty = t
             try:
                 pos = exchange.fetch_position(sym)
                 size = float(pos.get('contracts', 0))
                 if size > 0:
-                    if place_split_tps(sym, side_str, size, tp1, tp2, tp3):
+                    if place_split_tps(sym, side_str, size, tp1, tp2, tp3, strategy=strategy):
                         cur.execute("UPDATE active_trades SET status = 'OPEN_TPS_SET', updated_at = datetime('now') WHERE id = ?", (t_id,))
+                        conn.commit()
             except Exception as e:
                 logger.error(f"Poll Entry Error {sym}: {e}")
                 
         # 2. Manage 'OPEN_TPS_SET' for PnL, SL move, and Trailing Stop
-        cur.execute("SELECT t.id, t.symbol, t.side, t.entry_price, t.tp1, t.tp2, t.is_sl_moved, t.trailing_active, t.trailing_stop_price, s.natr FROM active_trades t LEFT JOIN trades s ON t.signal_id = s.id WHERE t.status = 'OPEN_TPS_SET'")
+        cur.execute("""
+            SELECT t.id, t.symbol, t.side, t.entry_price, t.tp1, t.tp2, t.is_sl_moved, 
+                   t.trailing_active, t.trailing_stop_price, s.natr, t.strategy, 
+                   t.quantity, t.avg_entry_price 
+            FROM active_trades t 
+            LEFT JOIN trades s ON t.signal_id = s.id 
+            WHERE t.status = 'OPEN_TPS_SET'
+        """)
         active_tps = cur.fetchall()
         for t in active_tps:
-            t_id, sym, side_str, entry, tp1, tp2, sl_moved, trail_active, trail_stop, natr_val = t
+            t_id, sym, side_str, entry, tp1, tp2, sl_moved, trail_active, trail_stop, natr_val, strategy, recorded_qty, avg_entry = t
             try:
                 pos = exchange.fetch_position(sym)
                 size = float(pos.get('contracts', 0))
@@ -244,30 +286,58 @@ def ccxt_poll_positions():
                         pnl = sum([float(tr['info'].get('realizedPnl', 0)) for tr in trades])
                     except: pnl = 0
                     cur.execute("UPDATE active_trades SET status = 'CLOSED', pnl = ?, updated_at = datetime('now') WHERE id = ?", (pnl, t_id))
+                    conn.commit()
                     logger.info(f"🏁 {sym} Pos Closed (Poll).")
                     continue
+
+                # --- GRID LAYER MONITORING ---
+                if strategy == 'GRID' and size > float(recorded_qty) + 0.00001:
+                    new_avg = float(pos.get('entryPrice', avg_entry))
+                    g_cfg = CONFIG.get('grid_setup', {'take_profit_percentage': 1.5})
+                    tp_pct = g_cfg['take_profit_percentage'] / 100
+                    new_tp = new_avg * (1 + tp_pct) if side_str.lower() in ['long', 'buy'] else new_avg * (1 - tp_pct)
+                    
+                    logger.info(f"📈 {sym} Grid Layer Filled! New AEP: {new_avg} | New TP: {new_tp}")
+                    
+                    # Update TP on exchange (Cancel old reduce-only orders first)
+                    try:
+                        open_orders = exchange.fetch_open_orders(sym)
+                        for oo in open_orders:
+                            if oo['side'].lower() == ('sell' if side_str.lower() in ['long', 'buy'] else 'buy') and oo.get('reduceOnly') == True:
+                                exchange.cancel_order(oo['id'], sym)
+                        
+                        place_split_tps(sym, side_str, size, new_tp, None, None, strategy='GRID')
+                    except Exception as e:
+                        logger.error(f"Failed to update GRID TP for {sym}: {e}")
+                    
+                    cur.execute("UPDATE active_trades SET quantity = ?, avg_entry_price = ?, tp1 = ?, grid_layer = grid_layer + 1 WHERE id = ?", (size, new_avg, new_tp, t_id))
+                    conn.commit()
+                    recorded_qty, avg_entry, tp1 = size, new_avg, new_tp
                 
                 mark = float(pos.get('markPrice', 0))
                 
-                # Check BEP Move (TP1 Hit)
-                hit_tp1 = (side_str == 'Long' and mark >= float(tp1)) or (side_str == 'Short' and mark <= float(tp1))
-                if hit_tp1 and not sl_moved:
-                    logger.info(f"♻️ {sym} TP1 Hit. Modifying SL to Break Even...")
-                    try:
-                        exchange.create_order(sym, 'stopMarket', 'sell' if side_str == 'Long' else 'buy', size, params={'stopPrice': float(entry), 'reduceOnly': True})
-                        cur.execute("UPDATE active_trades SET is_sl_moved = 1 WHERE id = ?", (t_id,))
-                    except: pass 
+                # Check BEP Move (TP1 Hit) - Only for NORMAL/SCALPING
+                if strategy != 'GRID':
+                    hit_tp1 = tp1 and ((side_str in ['Long', 'long'] and mark >= float(tp1)) or (side_str in ['Short', 'short'] and mark <= float(tp1)))
+                    if hit_tp1 and not sl_moved:
+                        logger.info(f"♻️ {sym} TP1 Hit. Modifying SL to Break Even...")
+                        try:
+                            exchange.create_order(sym, 'stopMarket', 'sell' if side_str in ['Long', 'long'] else 'buy', size, params={'stopPrice': float(entry), 'reduceOnly': True})
+                            cur.execute("UPDATE active_trades SET is_sl_moved = 1 WHERE id = ?", (t_id,))
+                            conn.commit()
+                        except: pass 
                     
-                # Check Trailing Activation (TP2 Hit)
-                hit_tp2 = (side_str == 'Long' and mark >= float(tp2)) or (side_str == 'Short' and mark <= float(tp2))
-                if hit_tp2 and not trail_active:
-                    logger.info(f"🚀 {sym} TP2 Hit! Activating Chandelier Trailing Stop...")
-                    cur.execute("UPDATE active_trades SET trailing_active = 1, trailing_stop_price = ? WHERE id = ?", (float(entry), t_id))
-                    trail_active = True
-                    trail_stop = float(entry)
+                # Check Trailing Activation (TP2 Hit) - Only for NORMAL
+                if strategy == 'NORMAL':
+                    hit_tp2 = (side_str == 'Long' and mark >= float(tp2)) or (side_str == 'Short' and mark <= float(tp2))
+                    if hit_tp2 and not trail_active:
+                        logger.info(f"🚀 {sym} TP2 Hit! Activating Chandelier Trailing Stop...")
+                        cur.execute("UPDATE active_trades SET trailing_active = 1, trailing_stop_price = ? WHERE id = ?", (float(entry), t_id))
+                        trail_active = True
+                        trail_stop = float(entry)
                     
                 # Trailing Logic Execution
-                if trail_active:
+                if strategy == 'NORMAL' and trail_active:
                     atr_buffer = float(natr_val if natr_val else (mark * 0.02)) * 2 # 2x ATR buffer or 4% default
                     if side_str == 'Long':
                         new_trail = mark - atr_buffer
@@ -307,7 +377,7 @@ def ingest_fresh_signals():
         markets = exchange.load_markets()
 
         query = """
-            SELECT t.id, t.symbol, t.side, t.entry_price, t.sl_price, t.tp1, t.tp2, t.tp3, t.natr
+            SELECT t.id, t.symbol, t.side, t.entry_price, t.sl_price, t.tp1, t.tp2, t.tp3, t.natr, t.timeframe
             FROM trades t
             LEFT JOIN active_trades a ON t.id = a.signal_id
             WHERE t.status = 'Waiting Entry'
@@ -319,8 +389,34 @@ def ingest_fresh_signals():
         
         for sig in signals:
             if current_active >= MAX_POSITIONS: break
-            sig_id, sym, side, entry, sl, tp1, tp2, tp3, natr = sig
+            sig_id, sym, side, entry, sl, tp1, tp2, tp3, natr, tf = sig
             entry, sl = float(entry), float(sl)
+
+            # --- Strategy Routing ---
+            strategy = 'NORMAL'
+            grid_max = 1
+            if tf in ['15m', '1h']:
+                strategy = 'SCALPING'
+                s_cfg = CONFIG.get('scalping_setup', {'tp_percentage': 1.5, 'sl_percentage': 1.0})
+                tp_pct = s_cfg['tp_percentage'] / 100
+                sl_pct = s_cfg['sl_percentage'] / 100
+                if side == 'Long':
+                    tp1 = entry * (1 + tp_pct)
+                    sl = entry * (1 - sl_pct)
+                else:
+                    tp1 = entry * (1 - tp_pct)
+                    sl = entry * (1 + sl_pct)
+                tp2, tp3 = None, None # Scalping uses single TP
+            elif tf in ['4h', '1d', '1w']:
+                strategy = 'GRID'
+                grid_max = CONFIG.get('grid_setup', {}).get('max_layers', 4)
+                g_cfg = CONFIG.get('grid_setup', {'take_profit_percentage': 1.5})
+                tp_pct = g_cfg['take_profit_percentage'] / 100
+                if side == 'Long':
+                    tp1 = entry * (1 + tp_pct)
+                else:
+                    tp1 = entry * (1 - tp_pct)
+                tp2, tp3 = None, None
             
             market = markets.get(sym)
             max_lev = 25
@@ -344,16 +440,107 @@ def ingest_fresh_signals():
             if position_value < 6.0: continue
 
             cur.execute("""
-                INSERT INTO active_trades (signal_id, symbol, side, entry_price, sl_price, tp1, tp2, tp3, quantity, leverage, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
-            """, (sig_id, sym, side, entry, sl, tp1, tp2, tp3, qty_coins, final_leverage))
+                INSERT INTO active_trades (signal_id, symbol, side, entry_price, sl_price, tp1, tp2, tp3, quantity, leverage, status, strategy, grid_max_layers, avg_entry_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+            """, (sig_id, sym, side, entry, sl, tp1, tp2, tp3, qty_coins, final_leverage, strategy, grid_max, entry))
             
-            logger.info(f"📥 Signal Ingested: {sym} | Lev: {final_leverage}x | Cost: ${margin_cost:.2f}")
+            logger.info(f"📥 Signal Ingested: {sym} ({strategy}) | TF: {tf} | Lev: {final_leverage}x")
             current_active += 1
             
         conn.commit()
     except Exception as e: logger.error(f"Ingest Error: {e}")
     finally: release_conn(conn)
+
+def execute_scalping_trade(exchange, oid, sym, side, entry, sl, tp1_val, qty, lev):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        try: exchange.set_leverage(int(lev), sym)
+        except: pass
+
+        ticker = exchange.fetch_ticker(sym)
+        current_price = float(ticker['last'])
+        
+        is_better_price = (side == 'Long' and current_price <= entry) or (side == 'Short' and current_price >= entry)
+        type_side = 'buy' if side == 'Long' else 'sell'
+        
+        params = {'stopLoss': float(sl)}
+        if tp1_val:
+            params['takeProfit'] = float(tp1_val)
+            
+        qty_str = exchange.amount_to_precision(sym, qty)
+        
+        if is_better_price:
+            res = exchange.create_order(sym, 'market', type_side, qty_str, None, params)
+        else:
+            res = exchange.create_order(sym, 'limit', type_side, qty_str, entry, params)
+        
+        if res and 'id' in res:
+            cur.execute("UPDATE active_trades SET order_id = ?, status = 'OPEN', updated_at = datetime('now') WHERE id = ?", (res['id'], oid))
+            conn.commit()
+            logger.info(f"✅ Scalping Order Placed for {sym}")
+            return True
+    except Exception as e:
+        logger.error(f"❌ Scalping Execution Failed {sym}: {e}")
+        cur.execute("UPDATE active_trades SET status = 'FAILED' WHERE id = ?", (oid,))
+        conn.commit()
+    finally: release_conn(conn)
+    return False
+
+def execute_grid_trade(exchange, oid, sym, side, entry, sl, tp1_val, qty, lev, grid_max):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        try: exchange.set_leverage(int(lev), sym)
+        except: pass
+
+        ticker = exchange.fetch_ticker(sym)
+        current_price = float(ticker['last'])
+        
+        is_better_price = (side == 'Long' and current_price <= entry) or (side == 'Short' and current_price >= entry)
+        type_side = 'buy' if side == 'Long' else 'sell'
+        
+        params = {'stopLoss': float(sl)}
+        if tp1_val:
+            params['takeProfit'] = float(tp1_val)
+            
+        qty_str = exchange.amount_to_precision(sym, qty)
+        
+        # Layer 1
+        if is_better_price:
+            res = exchange.create_order(sym, 'market', type_side, qty_str, None, params)
+        else:
+            res = exchange.create_order(sym, 'limit', type_side, qty_str, entry, params)
+        
+        if res and 'id' in res:
+            cur.execute("UPDATE active_trades SET order_id = ?, status = 'OPEN', updated_at = datetime('now') WHERE id = ?", (res['id'], oid))
+            conn.commit()
+            logger.info(f"✅ Grid Layer 1 Placed for {sym}")
+
+            # Subsequent Layers
+            g_cfg = CONFIG.get('grid_setup', {'price_step_percentage': 2.5, 'martingale_multiplier': 2.0})
+            price_step = g_cfg['price_step_percentage'] / 100
+            multiplier = g_cfg['martingale_multiplier']
+            
+            curr_p, curr_q = entry, qty
+            for i in range(2, grid_max + 1):
+                curr_p = curr_p * (1 - price_step) if side == 'Long' else curr_p * (1 + price_step)
+                curr_q = curr_q * multiplier
+                
+                p_s = exchange.price_to_precision(sym, curr_p)
+                q_s = exchange.amount_to_precision(sym, curr_q)
+                try:
+                    exchange.create_order(sym, 'limit', type_side, q_s, p_s, {'reduceOnly': False})
+                    logger.info(f"   🕸️ Layer {i} set at {p_s} (Qty: {q_s})")
+                except Exception as ex:
+                    logger.error(f"   ❌ Layer {i} Fail: {ex}")
+            return True
+    except Exception as e:
+        logger.error(f"❌ Grid Execution Failed {sym}: {e}")
+        cur.execute("UPDATE active_trades SET status = 'FAILED' WHERE id = ?", (oid,))
+        conn.commit()
+    finally: release_conn(conn)
+    return False
 
 def execute_pending_orders():
     exchange = active_engine['exchange']
@@ -362,42 +549,47 @@ def execute_pending_orders():
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, symbol, side, entry_price, sl_price, tp1, quantity, leverage FROM active_trades WHERE status = 'PENDING'")
+        cur.execute("SELECT id, symbol, side, entry_price, sl_price, tp1, quantity, leverage, strategy, grid_max_layers FROM active_trades WHERE status = 'PENDING'")
         orders = cur.fetchall()
         if not orders: return 
 
         for order in orders:
-            oid, sym, side, entry, sl, tp1_val, qty, lev = order
-            try:
-                try: exchange.set_leverage(int(lev), sym)
-                except: pass
+            oid, sym, side, entry, sl, tp1_val, qty, lev, strategy, grid_max = order
+            
+            if strategy == 'SCALPING':
+                execute_scalping_trade(exchange, oid, sym, side, entry, sl, tp1_val, qty, lev)
+            elif strategy == 'GRID':
+                execute_grid_trade(exchange, oid, sym, side, entry, sl, tp1_val, qty, lev, grid_max)
+            else:
+                # NORMAL Fallback
+                try:
+                    try: exchange.set_leverage(int(lev), sym)
+                    except: pass
 
-                ticker = exchange.fetch_ticker(sym)
-                current_price = float(ticker['last'])
-                entry = float(entry)
-                
-                is_better_price = (side == 'Long' and current_price <= entry) or (side == 'Short' and current_price >= entry)
-                type_side = 'buy' if side == 'Long' else 'sell'
-                
-                params = {'stopLoss': float(sl)}
-                if tp1_val:
-                    params['takeProfit'] = float(tp1_val)
+                    ticker = exchange.fetch_ticker(sym)
+                    current_price = float(ticker['last'])
                     
-                qty = float(exchange.amount_to_precision(sym, qty))
-                
-                if is_better_price:
-                    res = exchange.create_order(sym, 'market', type_side, qty, None, params)
-                else:
-                    res = exchange.create_order(sym, 'limit', type_side, entry, qty, params)
-                
-                if res and 'id' in res:
-                    cur.execute("UPDATE active_trades SET order_id = ?, status = 'OPEN' WHERE id = ?", (res['id'], oid))
+                    is_better_price = (side == 'Long' and current_price <= entry) or (side == 'Short' and current_price >= entry)
+                    type_side = 'buy' if side == 'Long' else 'sell'
+                    
+                    params = {'stopLoss': float(sl)}
+                    if tp1_val: params['takeProfit'] = float(tp1_val)
+                        
+                    qty_str = exchange.amount_to_precision(sym, qty)
+                    
+                    if is_better_price:
+                        res = exchange.create_order(sym, 'market', type_side, qty_str, None, params)
+                    else:
+                        res = exchange.create_order(sym, 'limit', type_side, qty_str, entry, params)
+                    
+                    if res and 'id' in res:
+                        cur.execute("UPDATE active_trades SET order_id = ?, status = 'OPEN', updated_at = datetime('now') WHERE id = ?", (res['id'], oid))
+                        conn.commit()
+                        logger.info(f"✅ Normal Order Placed for {sym}")
+                except Exception as e:
+                    logger.error(f"❌ Normal Execution Failed {sym}: {e}")
+                    cur.execute("UPDATE active_trades SET status = 'FAILED' WHERE id = ?", (oid,))
                     conn.commit()
-                    logger.info(f"✅ Order Placed for {sym} (ID: {res['id']})")
-            except Exception as e:
-                logger.error(f"❌ Execution Failed {sym}: {e}")
-                cur.execute("UPDATE active_trades SET status = 'FAILED' WHERE id = ?", (oid,))
-                conn.commit()
     except Exception as e: logger.error(f"Exec Loop Error: {e}")
     finally: release_conn(conn)
 

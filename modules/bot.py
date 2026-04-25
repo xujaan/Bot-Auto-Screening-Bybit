@@ -84,8 +84,14 @@ def send_telegram_alert(data, image_path=None):
     if active_cex == 'BINANCE': cex_url = f"https://www.binance.com/en/futures/{sym_no_slash}"
     elif active_cex == 'BITGET': cex_url = f"https://www.bitget.com/futures/usdt/{sym_no_slash}"
     
+    # Determine Mode
+    tf = data.get('Timeframe')
+    mode = "NORMAL"
+    if tf in ['15m', '1h']: mode = "SCALPING"
+    elif tf in ['4h', '1d', '1w']: mode = "GRID"
+
     text = f"**{emoji} SIGNAL: {data['Symbol']}**\n"
-    text += f"🏢 CEX: **[{active_cex}]({cex_url})**\n"
+    text += f"🏢 CEX: **[{active_cex}]({cex_url})** | 🛠️ Mode: **{mode}**\n"
     text += f"🧭 **{data['Side']}** | **{data['Timeframe']}** | {data['Pattern']}\n"
     text += f"🕒 `{ts}`\n\n"
     text += f"💵 **Current:** `{format_price(current_price)}`\n"
@@ -105,7 +111,52 @@ def send_telegram_alert(data, image_path=None):
     
     total_score = data.get('Tech_Score', 0) + data.get('SMC_Score', 0) + data.get('Quant_Score', 0) + data.get('Deriv_Score', 0)
     text += f"🏆 **Scores (Total: {total_score}):**\nTech: `{data.get('Tech_Score',0)}` | SMC: `{data.get('SMC_Score',0)}` | Quant: `{data.get('Quant_Score',0)}` | Deriv: `{data.get('Deriv_Score',0)}`\n"
-    text += f"🧠 **BTC Bias:** {data.get('BTC_Bias', '-')}"
+    text += f"🧠 **BTC Bias:** {data.get('BTC_Bias', '-')}\n\n"
+
+    # --- 🧠 BOT VERDICT ANALYSIS ---
+    analysis_notes = []
+    status = "🟢 READY (At/Near Entry)"
+    verdict = "⭐⭐ (Medium Risk)"
+    
+    entry_dist = abs(current_price - data['Entry']) / data['Entry'] * 100
+    
+    # 1. Price Filter
+    if data['Side'] == 'Long' and current_price > data['TP1']:
+        status = "🔴 SKIPPED (Target Achieved)"
+    elif data['Side'] == 'Short' and current_price < data['TP1']:
+        status = "🔴 SKIPPED (Target Achieved)"
+    elif entry_dist > 0.5:
+        status = "🟡 PENDING (Wait for Retest)"
+
+    # 2. Indicator Analysis
+    z_score = data.get('Z_Score', 0)
+    if z_score > 3.0:
+        analysis_notes.append("⚠️ Overbought/Jenuh Beli, rawan koreksi tajam.")
+    if data['Side'] == 'Long' and fund_pct > 0.1:
+        analysis_notes.append("⚠️ High Funding, biaya mahal & rawan Long Squeeze.")
+    if data['Side'] == 'Long' and data.get('OBI', 0) < -0.7:
+        analysis_notes.append("⚠️ Tembok jual tebal, butuh volume besar untuk tembus.")
+    if rvol > 5.0:
+        analysis_notes.append("⚡ Explosive Volume, gunakan leverage rendah (Max 5-10x).")
+
+    # 3. Final Verdict
+    if abs(fund_pct) > 0.15 or data.get('OBI', 0) < -0.9 or status.startswith("🔴"):
+        verdict = "❌ (High Risk / Avoid)"
+    elif total_score >= 16 and z_score < 2.0 and abs(fund_pct) < 0.05 and entry_dist <= 0.5:
+        verdict = "⭐⭐⭐ (High Quality)"
+
+    text += f"🧠 **VERDICT: {verdict}**\n"
+    text += f"Status: **{status}**\n"
+    if analysis_notes:
+        text += "Analisis: " + " ".join(analysis_notes) + "\n"
+    
+    if status == "🟡 PENDING (Wait for Retest)":
+        text += f"Action: Pasang jaring di `{format_price(data['Entry'])}`. Jangan Market Buy.\n"
+    elif status == "🟢 READY (At/Near Entry)":
+        text += f"Action: Eksekusi bertahap di area `{format_price(data['Entry'])}`.\n"
+    
+    if rvol > 4.0:
+        text += "Note: Volatilitas tinggi detected, ketatkan stop loss."
     
     url = f"https://api.telegram.org/bot{token}/"
     
@@ -201,13 +252,15 @@ def send_alert(data):
                   data.get('SMC_Score',0), data.get('Basis',0), data.get('BTC_Bias',''), data.get('Z_Score',0), data.get('Zeta_Score',0), data.get('OBI',0), 
                   data.get('Tech_Reasons',''), data.get('Quant_Reasons',''), data.get('Deriv_Reasons',''), str(data.get('SMC_Reasons','')),
                   msg_id, data.get('NATR', 0.0)))
+            cur.execute("SELECT last_insert_rowid()")
+            row_id = cur.fetchone()[0]
             conn.commit()
             release_conn(conn)
-            return True
+            return row_id, msg_id
         except Exception as e:
             print(f"DB Insert Error after alert: {e}")
             
-    return False
+    return None, None
 
 def update_status_dashboard():
     # Only updates Telegram Dashboard now
@@ -240,13 +293,31 @@ def send_scan_completion(count, duration, bias, dispatched_signals=None):
             sorted_signals = sorted(dispatched_signals, key=lambda x: x.get('Total_Score', 0), reverse=True)
             text += "\n\n🏆 **Signal Leaderboard:**\n"
             
+            markup = {"inline_keyboard": []}
             for idx, sig in enumerate(sorted_signals):
                 emoji = "🚀" if sig['Side'] == 'Long' else "🔻"
                 score = sig.get('Total_Score', 0)
-                text += f"{idx+1}. {emoji} **{sig['Symbol']}** ({sig['Timeframe']}) \\- Score: `{score}`\n"
+                sym_clean = sig['Symbol'].split(':')[0]
+                text += f"{idx+1}. {emoji} **{sym_clean}** ({sig['Timeframe']}) \\- Score: `{score}`\n"
                 
+                # Create navigation button if message_id exists
+                m_id = sig.get('message_id')
+                if m_id:
+                    c_id = str(tg_chat)
+                    if c_id.startswith("-100"):
+                        # Supergroup/Channel link
+                        link = f"https://t.me/c/{c_id[4:]}/{m_id}"
+                        markup["inline_keyboard"].append([{"text": f"🔍 View {sym_clean} ({sig['Side']})", "url": link}])
+                    else:
+                        # Private Chat: Use callback because URL links don't work
+                        markup["inline_keyboard"].append([{"text": f"🔍 View {sym_clean} ({sig['Side']})", "callback_data": f"jump_{m_id}"}])
+            
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-        try: requests.post(url, json={'chat_id': tg_chat, 'text': telegramify_markdown.markdownify(text), 'parse_mode': 'MarkdownV2'})
+        payload = {'chat_id': tg_chat, 'text': telegramify_markdown.markdownify(text), 'parse_mode': 'MarkdownV2'}
+        if dispatched_signals and markup["inline_keyboard"]:
+            payload['reply_markup'] = json.dumps(markup)
+            
+        try: requests.post(url, json=payload)
         except: pass
 
 def run_fast_update(exchange=None):

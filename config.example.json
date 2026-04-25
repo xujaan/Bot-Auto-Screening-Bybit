@@ -57,5 +57,15 @@
     "ascending_triangle": "Long",
     "descending_triangle": "Short",
     "bullish_rectangle": "Long"
+  },
+  "scalping_setup": {
+    "tp_percentage": 1.5,
+    "sl_percentage": 1.0
+  },
+  "grid_setup": {
+    "max_layers": 4,
+    "price_step_percentage": 2.5,
+    "martingale_multiplier": 2.0,
+    "take_profit_percentage": 1.2
   }
 }

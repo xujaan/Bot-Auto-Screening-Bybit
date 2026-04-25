@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SCAN_ABORT_FLAG = False
 AUTOSCAN_ENABLED = False
 from modules.config_loader import CONFIG
-from modules.database import init_db, get_active_signals
+from modules.database import init_db, get_active_signals, get_conn, release_conn
 from modules.technicals import get_technicals, detect_divergence, check_volatility_squeeze, detect_regime
 from modules.quant import calculate_metrics, check_fakeout
 from modules.derivatives import analyze_derivatives
@@ -40,12 +40,13 @@ def calculate_rr(entry, sl, tp3):
     risk = abs(entry - sl)
     return round(abs(tp3 - entry) / risk, 2) if risk > 0 else 0.0
 
-def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache):
+def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache, ticker_info=None):
     # 1. DUPLICATE CHECK
     if (symbol, timeframe) in active_signals: return None
     
     try:
-        ticker_info = exchange.fetch_ticker(symbol)
+        if ticker_info is None:
+            ticker_info = exchange.fetch_ticker(symbol)
         if "ST" in ticker_info.get('info', {}).get('symbol', ''): return None
         
         min_candles = CONFIG['system'].get('min_candles_analysis', 150)
@@ -226,21 +227,46 @@ def scan(progress_callback=None):
         tfs = CONFIG['system']['timeframes']
         macro_cache = {} # MTC Phase cache
         
+        max_workers = CONFIG['system'].get('max_threads', 10)
+        all_tickers = {}
+        try:
+            if progress_callback: progress_callback(f"📡 **Fetching bulk prices** from {platform.upper()}...")
+            all_tickers = exchange.fetch_tickers(syms)
+        except Exception as e:
+            print(f"Bulk ticker fetch failed: {e}")
+
         for i, tf in enumerate(reversed(tfs)):
             if SCAN_ABORT_FLAG: break
             scan_results = []
-            for s_idx, s in enumerate(syms):
-                if SCAN_ABORT_FLAG: break
+            
+            if progress_callback:
+                progress_callback(f"⏳ **Analyzing Timeframe {tf}** ({i+1}/{len(tfs)})\nPreparing parallel scan for {c} pairs...")
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                future_to_symbol = {
+                    executor.submit(analyze_ticker, s, tf, btc_bias, active_signals, macro_cache, all_tickers.get(s)): s 
+                    for s in syms
+                }
                 
-                # Real-time progress update every 20 pairs (~3 seconds) to prevent TG rate limit
-                if s_idx % 20 == 0 and progress_callback:
-                    progress_callback(f"⏳ **Analyzing Timeframe {tf}** ({i+1}/{len(tfs)})\nScanning: {s_idx}/{c} pairs... (`{s}`)")
+                completed = 0
+                for future in as_completed(future_to_symbol):
+                    if SCAN_ABORT_FLAG:
+                        # Stop processing new results
+                        break
                     
-                try:
-                    res = analyze_ticker(s, tf, btc_bias, active_signals, macro_cache)
-                    if res: scan_results.append(res)
-                except Exception as e:
-                    print(f"Error on {s}: {e}")
+                    completed += 1
+                    s = future_to_symbol[future]
+                    
+                    # Update progress every 20 pairs
+                    if completed % 20 == 0 and progress_callback:
+                        progress_callback(f"⏳ **Analyzing Timeframe {tf}** ({i+1}/{len(tfs)})\nProgress: {completed}/{c} pairs... (Last: `{s}`)")
+                    
+                    try:
+                        res = future.result()
+                        if res: scan_results.append(res)
+                    except Exception as e:
+                        print(f"Error on {s}: {e}")
             
             # Sort by total score
             for res in scan_results:
@@ -258,15 +284,27 @@ def scan(progress_callback=None):
                 
             for res in scan_results:
                 if SCAN_ABORT_FLAG: break
-                success = send_alert(res)
-                if success: 
+                trade_id, msg_id = send_alert(res)
+                if trade_id: 
                     signal_count += 1
+                    res['message_id'] = msg_id
                     all_dispatched.append(res)
                     if risk_cfg.get('auto_trade', False):
                         if active_pos_count < risk_cfg.get('max_concurrent_trades', 2):
                             import modules.execution as execution
-                            if execution.execute_entry(exchange, res):
+                            exec_res = execution.execute_entry(exchange, res)
+                            if exec_res:
                                 active_pos_count += 1
+                                conn = get_conn()
+                                try:
+                                    cur = conn.cursor()
+                                    cur.execute("""
+                                        INSERT INTO active_trades (signal_id, symbol, side, entry_price, sl_price, tp1, tp2, tp3, quantity, leverage, order_id, status, strategy, grid_max_layers, avg_entry_price)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?)
+                                    """, (trade_id, exec_res['symbol'], exec_res['side'], exec_res['entry_price'], exec_res['sl'], exec_res.get('tp1'), exec_res.get('tp2'), exec_res.get('tp3'), exec_res['qty'], exec_res['leverage'], exec_res['order_id'], exec_res['strategy'], exec_res['grid_max'], exec_res['entry_price']))
+                                    conn.commit()
+                                except: pass
+                                finally: release_conn(conn)
                         else:
                             print(f"⏩ Skipped {res['Symbol']} (Quota full: {active_pos_count}/{risk_cfg.get('max_concurrent_trades', 2)})")
                         
