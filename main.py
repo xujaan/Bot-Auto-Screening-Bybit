@@ -9,6 +9,7 @@ import pandas as pd
 import pandas_ta_classic as ta
 import numpy as np
 import traceback
+from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 SCAN_ABORT_FLAG = False
 AUTOSCAN_ENABLED = False
@@ -36,12 +37,26 @@ def get_btc_bias():
         return "Bullish" if curr['ema13'] > curr['ema21'] else "Bearish"
     except: return "Sideways"
 
-def calculate_rr(entry, sl, tp3):
-    if entry <= 0 or sl <= 0 or tp3 <= 0: return 0.0
+def calculate_rr(entry, sl, target):
+    if entry <= 0 or sl <= 0 or target <= 0: return 0.0
     risk = abs(entry - sl)
-    return round(abs(tp3 - entry) / risk, 2) if risk > 0 else 0.0
+    return round(abs(target - entry) / risk, 2) if risk > 0 else 0.0
 
-def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache, ticker_info=None):
+def format_rejection_summary(diagnostics, limit=8):
+    counts = diagnostics.get("counts", {}) if diagnostics else {}
+    examples = diagnostics.get("examples", {}) if diagnostics else {}
+    if not counts:
+        return "No HIGH_WR rejection diagnostics."
+    rows = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+    lines = ["HIGH_WR reject diagnostics:"]
+    for reason, count in rows:
+        sample = "; ".join(examples.get(reason, [])[:3])
+        suffix = f" | ex: {sample}" if sample else ""
+        lines.append(f"- {reason}: {count}{suffix}")
+    return "\n".join(lines)
+
+
+def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache, ticker_info=None, diagnostics=None, order_book_cache=None):
     # 1. DUPLICATE CHECK
     if (symbol, timeframe) in active_signals: return None
     
@@ -61,8 +76,52 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache, tic
         # 2. Technicals & Pattern
         df = get_technicals(df)
 
+        # Shared order book snapshot, cached once per symbol across timeframes.
+        # Used by HIGH_WR_SCALP scoring and the classical-path OBI fallback.
+        order_book = None
+        if order_book_cache is not None:
+            if symbol in order_book_cache:
+                order_book = order_book_cache[symbol]
+            else:
+                try:
+                    order_book = exchange.fetch_order_book(
+                        symbol,
+                        limit=int(CONFIG.get('high_wr_scalp', {}).get('order_book_limit', 25))
+                    )
+                except Exception as ob_err:
+                    print(f"Order book fetch failed for {symbol}: {ob_err}")
+                order_book_cache[symbol] = order_book
+
         high_wr_cfg = CONFIG.get('high_wr_scalp', {})
         if is_enabled_for_timeframe(timeframe, high_wr_cfg):
+            confirmation_df = None
+            macro_df = None
+            confirmation_tf = str(high_wr_cfg.get("confirmation_timeframe", "30m"))
+            if high_wr_cfg.get("require_30m_confirmation", True):
+                if timeframe == confirmation_tf:
+                    confirmation_df = df.copy()
+                else:
+                    confirmation_bars = exchange.fetch_ohlcv(symbol, confirmation_tf, limit=min_candles + 200)
+                    if confirmation_bars and len(confirmation_bars) >= min_candles:
+                        confirmation_df = pd.DataFrame(
+                            confirmation_bars,
+                            columns=['timestamp','open','high','low','close','volume']
+                        )
+                        confirmation_df['timestamp'] = pd.to_datetime(confirmation_df['timestamp'], unit='ms')
+                        confirmation_df = get_technicals(confirmation_df)
+            if high_wr_cfg.get("require_4h_confirmation", True):
+                macro_tf = str(high_wr_cfg.get("macro_timeframe", "4h"))
+                if timeframe == macro_tf:
+                    macro_df = df.copy()
+                else:
+                    macro_bars = exchange.fetch_ohlcv(symbol, macro_tf, limit=min_candles + 200)
+                    if macro_bars and len(macro_bars) >= min_candles:
+                        macro_df = pd.DataFrame(
+                            macro_bars,
+                            columns=['timestamp','open','high','low','close','volume']
+                        )
+                        macro_df['timestamp'] = pd.to_datetime(macro_df['timestamp'], unit='ms')
+                        macro_df = get_technicals(macro_df)
             high_wr_signal = analyze_high_wr_scalp(
                 df.copy(),
                 ticker_info,
@@ -70,9 +129,13 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache, tic
                 timeframe,
                 high_wr_cfg,
                 macro_cache.get(symbol),
+                confirmation_df,
+                macro_df,
+                order_book,
+                diagnostics,
+                btc_bias,
             )
             if high_wr_signal:
-                high_wr_signal["BTC_Bias"] = btc_bias
                 return high_wr_signal
             return None
 
@@ -100,7 +163,7 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache, tic
         # if not valid_smc: return None  # Un-comment for strict SMC
 
         # 4. Quant & Deriv Metrics
-        df, basis, z_score, zeta_score, obi, quant_score, quant_reasons = calculate_metrics(df, ticker_info)
+        df, basis, z_score, zeta_score, obi, quant_score, quant_reasons = calculate_metrics(df, ticker_info, order_book=order_book)
         valid_deriv, deriv_score, deriv_reasons = analyze_derivatives(df, ticker_info, side)
         if not valid_deriv: return None
 
@@ -170,8 +233,13 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache, tic
             sl = swing_high + (rng * s['fib_sl'])
             tp1, tp2, tp3 = swing_high - rng, swing_high - (rng*1.618), swing_high - (rng*2.618)
             
-        rr = calculate_rr(entry, sl, tp3)
-        if rr < CONFIG['strategy'].get('risk_reward_min', 2.0): return None
+        # Gate on realistic near-term targets. TP3 (the runner) sits at ~3R by
+        # construction with the fib setup, so gating on it never filters.
+        rr_tp1 = calculate_rr(entry, sl, tp1)
+        rr_tp2 = calculate_rr(entry, sl, tp2)
+        if rr_tp1 < CONFIG['strategy'].get('risk_reward_min_tp1', 0.6): return None
+        if rr_tp2 < CONFIG['strategy'].get('risk_reward_min_tp2', 1.2): return None
+        rr = rr_tp2
         
         df['funding'] = float(ticker_info.get('info', {}).get('fundingRate', 0))
         
@@ -179,7 +247,8 @@ def analyze_ticker(symbol, timeframe, btc_bias, active_signals, macro_cache, tic
         natr_val = df['NATR_14'].iloc[-1] if 'NATR_14' in df.columns else 0.0
         return {
             "Symbol": symbol, "Side": side, "Timeframe": timeframe, "Pattern": pattern,
-            "Entry": float(entry), "SL": float(sl), "TP1": float(tp1), "TP2": float(tp2), "TP3": float(tp3), "RR": float(rr),
+            "Entry": float(entry), "SL": float(sl), "TP1": float(tp1), "TP2": float(tp2), "TP3": float(tp3),
+            "RR": float(rr), "RR_TP1": float(rr_tp1), "RR_TP2": float(rr_tp2),
             "Tech_Score": int(tech_score), "Quant_Score": int(quant_score), 
             "Deriv_Score": int(deriv_score), "SMC_Score": int(smc_score),
             "Basis": float(basis), "Z_Score": float(z_score), "Zeta_Score": float(zeta_score), "OBI": float(obi),
@@ -243,6 +312,7 @@ def scan(progress_callback=None):
 
         tfs = CONFIG['system']['timeframes']
         macro_cache = {} # MTC Phase cache
+        order_book_cache = {}  # One order book snapshot per symbol, shared across timeframes
         
         max_workers = CONFIG['system'].get('max_threads', 10)
         all_tickers = {}
@@ -255,6 +325,12 @@ def scan(progress_callback=None):
         for i, tf in enumerate(reversed(tfs)):
             if SCAN_ABORT_FLAG: break
             scan_results = []
+            high_wr_diagnostics = {
+                "counts": {},
+                "examples": {},
+                "lock": Lock(),
+                "max_examples": 5,
+            }
             
             if progress_callback:
                 progress_callback(f"⏳ **Analyzing Timeframe {tf}** ({i+1}/{len(tfs)})\nPreparing parallel scan for {c} pairs...")
@@ -262,7 +338,7 @@ def scan(progress_callback=None):
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks
                 future_to_symbol = {
-                    executor.submit(analyze_ticker, s, tf, btc_bias, active_signals, macro_cache, all_tickers.get(s)): s 
+                    executor.submit(analyze_ticker, s, tf, btc_bias, active_signals, macro_cache, all_tickers.get(s), high_wr_diagnostics, order_book_cache): s
                     for s in syms
                 }
                 
@@ -284,6 +360,12 @@ def scan(progress_callback=None):
                         if res: scan_results.append(res)
                     except Exception as e:
                         print(f"Error on {s}: {e}")
+
+            if is_enabled_for_timeframe(tf, CONFIG.get('high_wr_scalp', {})):
+                summary = format_rejection_summary(high_wr_diagnostics)
+                print(summary)
+                if progress_callback:
+                    progress_callback(f"📊 **{tf} Diagnostics**\n```text\n{summary}\n```")
             
             # Sort by total score
             for res in scan_results:

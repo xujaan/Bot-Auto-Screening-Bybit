@@ -5,7 +5,13 @@ from scipy.special import expit
 def calculate_z_score(series, window=20):
     mean = series.rolling(window=window).mean()
     std = series.rolling(window=window).std()
-    return (series - mean) / std
+    if std is None or len(std) == 0:
+        return series * 0.0
+    # Guard: zero or undefined std (e.g. flat volume) would produce inf/NaN
+    # z-scores that could inflate the score; map those values to 0 instead.
+    safe_std = std.where(std > 0)
+    z = (series - mean) / safe_std
+    return z.fillna(0.0)
 
 def calculate_zeta_field(df, basis):
     try:
@@ -34,13 +40,38 @@ def calculate_zeta_field(df, basis):
         return zeta_score, score_add, reason
     except: return 50.0, 0, ""
 
-def calculate_obi(ticker):
-    try:
-        bid, ask = ticker.get('bidVolume', 0), ticker.get('askVolume', 0)
-        return (bid - ask) / (bid + ask) if (bid + ask) > 0 else 0.0
-    except: return 0.0
+def calculate_obi(ticker, order_book=None):
+    """
+    Order Book Imbalance (OBI): (bid_notional - ask_notional) / total notional.
 
-def calculate_metrics(df, ticker):
+    Prefers exchange-provided bid/ask volume when present; falls back to
+    computing from an order book depth snapshot, mirroring the HIGH_WR_SCALP
+    approach (swap tickers often leave bidVolume/askVolume empty).
+    """
+    try:
+        bid, ask = ticker.get('bidVolume'), ticker.get('askVolume')
+        if bid is not None and ask is not None:
+            bid, ask = float(bid), float(ask)
+            if bid + ask > 0:
+                return (bid - ask) / (bid + ask)
+    except Exception:
+        pass
+
+    if order_book:
+        try:
+            bids = order_book.get('bids') or []
+            asks = order_book.get('asks') or []
+            if bids and asks:
+                bid_notional = sum(float(p) * float(q) for p, q, *_ in bids)
+                ask_notional = sum(float(p) * float(q) for p, q, *_ in asks)
+                total = bid_notional + ask_notional
+                if total > 0:
+                    return (bid_notional - ask_notional) / total
+        except Exception:
+            pass
+    return 0.0
+
+def calculate_metrics(df, ticker, order_book=None):
     mark = float(ticker.get('last', 0))
     index = float(ticker.get('info', {}).get('indexPrice', mark))
     basis = (mark - index) / index if index > 0 else 0
@@ -51,7 +82,7 @@ def calculate_metrics(df, ticker):
     z_score = df['Vol_Z'].iloc[-1]
     
     zeta_score, zeta_bonus, zeta_reason = calculate_zeta_field(df, basis)
-    obi = calculate_obi(ticker)
+    obi = calculate_obi(ticker, order_book)
     
     score, reasons = 2, []
     if df['RVOL'].iloc[-1] > 5.0: score += 1; reasons.append("Nuclear RVOL")

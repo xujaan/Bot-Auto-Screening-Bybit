@@ -11,6 +11,11 @@ import math
 import pandas as pd
 from modules.technicals import calculate_atr, find_swing_low, find_swing_high, calculate_dynamic_sl
 
+HIGH_WR_PATTERNS = {'BREAKOUT_RETEST', 'TREND_PULLBACK'}
+
+def is_high_wr_signal(res):
+    return res.get('Mode') == 'HIGH_WR_SCALP' or str(res.get('Pattern', '')).upper() in HIGH_WR_PATTERNS
+
 def set_leverage(exchange, symbol, lev):
     try:
         exchange.set_leverage(lev, symbol)
@@ -36,7 +41,9 @@ def execute_entry(exchange, res):
     tp2 = res.get('TP2')
     tp3 = res.get('TP3')
 
-    if tf in ['15m', '1h']:
+    if is_high_wr_signal(res):
+        strategy = 'HIGH_WR_SCALP'
+    elif tf in ['15m', '1h']:
         strategy = 'SCALPING'
         s_cfg = CONFIG.get('scalping_setup', {'tp_percentage': 1.5, 'sl_percentage': 1.0})
         tp_pct = s_cfg['tp_percentage'] / 100
@@ -120,7 +127,8 @@ def execute_entry(exchange, res):
     print(f"🚀 (Manual/Auto) {strategy} Order {symbol} | Entry: {price_str}")
     
     params = {'stopLoss': float(sl)}
-    if tp1: params['takeProfit'] = float(tp1)
+    if tp1 and strategy != 'HIGH_WR_SCALP':
+        params['takeProfit'] = float(tp1)
         
     try:
         order = exchange.create_order(symbol, 'limit', side, qty_str, price_str, params)

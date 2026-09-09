@@ -30,6 +30,8 @@ TARGET_LEVERAGE = 25
 RISK_PERCENT = 0.01           
 MAX_POSITIONS = 40            
 TP_SPLIT = [0.30, 0.30, 0.40] 
+HIGH_WR_TP_SPLIT = [0.20, 0.80]
+HIGH_WR_PATTERNS = {'BREAKOUT_RETEST', 'TREND_PULLBACK'}
 ADAPTIVE_DEFAULTS = {
     'enabled': True,
     'check_interval_seconds': 30,
@@ -114,6 +116,12 @@ def timeframe_to_minutes(timeframe):
         return int(tf[:-1] or 0) * 10080
     return 15
 
+def is_high_wr_signal(pattern, timeframe):
+    return str(pattern or '').upper() in HIGH_WR_PATTERNS and str(timeframe or '') in ['15m', '30m']
+
+def is_high_wr_strategy(strategy):
+    return str(strategy or '').upper() == 'HIGH_WR_SCALP'
+
 def parse_db_timestamp(value):
     if not value:
         return None
@@ -179,6 +187,45 @@ def place_split_tps(symbol, side, total_qty, tp1, tp2, tp3, strategy='NORMAL'):
         
         params = {'reduceOnly': True}
         
+        if is_high_wr_strategy(strategy):
+            if tp1 is None:
+                return False
+            cancel_reduce_only_orders(symbol, order_side=tp_side, only_limit=True)
+            hw_cfg = CONFIG.get('high_wr_scalp', {}) or {}
+            splits = hw_cfg.get('tp_splits') or HIGH_WR_TP_SPLIT
+            tp1_ratio = float(splits[0]) if splits else 0.20
+            if hw_cfg.get('use_trailing_runner', True):
+                # Runner model: place a partial TP1 only (tp1_ratio of the size).
+                # The rest is a runner managed by the Chandelier trailing stop:
+                # SL moved to BE after TP1 fills, then trailed trail_atr_mult ATR
+                # behind the peak (mirrors backtest_compare_rr.py RR 1:5 / trail 3 ATR).
+                q1 = float(exchange.amount_to_precision(symbol, float(total_qty) * tp1_ratio))
+                if q1 <= 0:
+                    return False
+                p_str = exchange.price_to_precision(symbol, float(tp1))
+                exchange.create_order(symbol, 'limit', tp_side, q1, p_str, params)
+                logger.info(f"⚡ HIGH_WR TP1 {tp1_ratio*100:.0f}% @ {p_str} qty={q1} | "
+                            f"{100 - tp1_ratio*100:.0f}% runner trailed (Chandelier)")
+                return True
+            # Legacy multi-TP placement (backward compatible configs)
+            if tp2 is None or tp3 is None:
+                return False
+            q1 = float(exchange.amount_to_precision(symbol, float(total_qty) * tp1_ratio))
+            q2_ratio = float(splits[1]) if len(splits) > 1 else 0.15
+            q2 = float(exchange.amount_to_precision(symbol, float(total_qty) * q2_ratio))
+            q3 = float(exchange.amount_to_precision(symbol, float(total_qty) - q1 - q2))
+            tps = [(tp1, q1, round(tp1_ratio * 100)), (tp2, q2, round(q2_ratio * 100)), (tp3, q3, 15)]
+            logger.info(f"⚡ Placing HIGH_WR split TPs for {symbol}: {[p for _, _, p in tps]}")
+            placed = 0
+            for tp_price, qty, pct in tps:
+                if qty <= 0:
+                    continue
+                p_str = exchange.price_to_precision(symbol, float(tp_price))
+                exchange.create_order(symbol, 'limit', tp_side, qty, p_str, params)
+                logger.info(f"   ✅ HIGH_WR TP {pct}% @ {p_str} qty={qty}")
+                placed += 1
+            return placed > 0
+
         if strategy in ['SCALPING', 'GRID']:
             if tp1 is None: return False
             q_str = exchange.amount_to_precision(symbol, total_qty)
@@ -200,6 +247,32 @@ def place_split_tps(symbol, side, total_qty, tp1, tp2, tp3, strategy='NORMAL'):
     except Exception as e:
         logger.error(f"⚠️ TP Fail {symbol}: {e}")
         return False
+
+def maybe_move_high_wr_sl_to_be(cur, t_id, sym, side, entry, size, recorded_qty, sl_moved):
+    if sl_moved or not recorded_qty or float(recorded_qty) <= 0:
+        return False
+    remaining_ratio = float(size) / float(recorded_qty)
+    hw_cfg = CONFIG.get('high_wr_scalp', {}) or {}
+    splits = hw_cfg.get('tp_splits') or HIGH_WR_TP_SPLIT
+    tp1_ratio = float(splits[0]) if splits else 0.20
+    # BE after TP1: remaining size must have dropped by ~90% of the TP1 slice.
+    # With the runner model (TP1 = tp1_ratio of the size), remaining after TP1
+    # fill is (1 - tp1_ratio), e.g. 0.80 with the default 20/80 split.
+    if remaining_ratio > 1.0 - tp1_ratio * 0.90:
+        return False
+    if update_stop_loss_on_exchange(sym, side, float(size), float(entry)):
+        cur.execute("""
+            UPDATE active_trades
+            SET is_sl_moved = 1, sl_price = ?, quantity = ?, partial_tp_done = 1,
+                locked_profit_level = CASE WHEN locked_profit_level < 2 THEN 2 ELSE locked_profit_level END,
+                last_sl_update_at = datetime('now'), last_management_note = 'high_wr_tp1_be',
+                last_action_type = 'sl_update', last_action_at = datetime('now'),
+                updated_at = datetime('now')
+            WHERE id = ?
+        """, (float(entry), float(size), t_id))
+        logger.info(f"♻️ {sym} HIGH_WR TP1 filled. SL moved to BE ({entry}) for remaining size={size}")
+        return True
+    return False
 
 def fetch_management_candles(exchange, symbol, timeframe, limit=60):
     bars = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -414,11 +487,18 @@ def on_position_update(message):
             conn = get_conn()
             try:
                 cur = conn.cursor()
-                cur.execute("SELECT id, entry_price, tp1, is_sl_moved, status, strategy, quantity, avg_entry_price, origin_timeframe FROM active_trades WHERE symbol = ? AND status = 'OPEN_TPS_SET'", (symbol,))
+                cur.execute("""
+                    SELECT t.id, t.entry_price, t.tp1, t.is_sl_moved, t.status, t.strategy, t.quantity,
+                           t.avg_entry_price, t.origin_timeframe, t.trailing_active, t.trailing_stop_price,
+                           s.natr
+                    FROM active_trades t
+                    LEFT JOIN trades s ON t.signal_id = s.id
+                    WHERE t.symbol = ? AND t.status = 'OPEN_TPS_SET'
+                """, (symbol,))
                 row = cur.fetchone()
                 
                 if row:
-                    t_id, entry, tp1, sl_moved, status, strategy, recorded_qty, avg_entry, origin_tf = row
+                    t_id, entry, tp1, sl_moved, status, strategy, recorded_qty, avg_entry, origin_tf, trail_active, trail_stop, natr_val = row
                     
                     if size == 0:
                         logger.info(f"🏁 {symbol} Pos Closed (WS).")
@@ -456,7 +536,38 @@ def on_position_update(message):
                         conn.commit()
                         recorded_qty, tp1 = size, new_tp
 
-                    if strategy != 'GRID':
+                    if is_high_wr_strategy(strategy):
+                        if maybe_move_high_wr_sl_to_be(cur, t_id, symbol, side, entry, size, recorded_qty, sl_moved):
+                            conn.commit()
+                            recorded_qty = size
+                            sl_moved = 1
+
+                        # HIGH_WR Chandelier trailing: runner activates once TP1
+                        # filled (SL at BE), then ratchets trail_atr_mult ATR behind
+                        # the peak (mirrors backtest_compare_rr.py trail 3 ATR).
+                        trail_mult = float((CONFIG.get('high_wr_scalp', {}) or {}).get('trail_atr_mult', 3.0))
+                        if sl_moved and not trail_active:
+                            trail_active = True
+                            trail_stop = float(entry)
+                            cur.execute("UPDATE active_trades SET trailing_active = 1, trailing_stop_price = ? WHERE id = ?", (float(entry), t_id))
+                            conn.commit()
+                            logger.info(f"🚀 {symbol} HIGH_WR TP1 filled. Activating Chandelier Trail ({trail_mult:.0f} ATR)...")
+                        if trail_active:
+                            atr_buffer = float(natr_val if natr_val else (mark_price * 0.02)) * trail_mult
+                            if side.lower() in ['buy', 'long']:
+                                new_trail = mark_price - atr_buffer
+                                if not trail_stop or new_trail > float(trail_stop):
+                                    if active_engine['exchange'].set_position_stop_loss(symbol, new_trail, side.lower()):
+                                        cur.execute("UPDATE active_trades SET trailing_stop_price = ?, sl_price = ?, last_sl_update_at = datetime('now'), last_management_note = 'trailing_stop_update', updated_at = datetime('now') WHERE id = ?", (new_trail, new_trail, t_id))
+                                        conn.commit()
+                            else:
+                                new_trail = mark_price + atr_buffer
+                                if not trail_stop or new_trail < float(trail_stop):
+                                    if active_engine['exchange'].set_position_stop_loss(symbol, new_trail, side.lower()):
+                                        cur.execute("UPDATE active_trades SET trailing_stop_price = ?, sl_price = ?, last_sl_update_at = datetime('now'), last_management_note = 'trailing_stop_update', updated_at = datetime('now') WHERE id = ?", (new_trail, new_trail, t_id))
+                                        conn.commit()
+
+                    if strategy != 'GRID' and not is_high_wr_strategy(strategy):
                         # --- BEP Trigger based on timeframe-specific adaptive ratio ---
                         if tp1 and not sl_moved:
                             dist_to_tp = abs(float(tp1) - entry)
@@ -558,7 +669,13 @@ def ccxt_poll_positions():
                 mark = float(pos.get('markPrice', 0))
                 
                 # Check BEP Move using timeframe-specific adaptive ratio
-                if strategy != 'GRID':
+                if is_high_wr_strategy(strategy):
+                    if maybe_move_high_wr_sl_to_be(cur, t_id, sym, side_str, entry, size, recorded_qty, sl_moved):
+                        conn.commit()
+                        recorded_qty = size
+                        sl_moved = 1
+
+                if strategy != 'GRID' and not is_high_wr_strategy(strategy):
                     if tp1 and not sl_moved:
                         dist_to_tp = abs(float(tp1) - entry)
                         profile = get_tf_profile(origin_tf or '15m', get_adaptive_cfg())
@@ -583,7 +700,8 @@ def ccxt_poll_positions():
                             except Exception as e:
                                 logger.error(f"Failed to set BEP for {sym}: {e}")
                     
-                # Check Trailing Activation (TP2 Hit) - Only for NORMAL
+                # Check Trailing Activation
+                trail_mult = 2.0
                 if strategy == 'NORMAL':
                     hit_tp2 = (side_str == 'Long' and mark >= float(tp2)) or (side_str == 'Short' and mark <= float(tp2))
                     if hit_tp2 and not trail_active:
@@ -591,30 +709,40 @@ def ccxt_poll_positions():
                         cur.execute("UPDATE active_trades SET trailing_active = 1, trailing_stop_price = ? WHERE id = ?", (float(entry), t_id))
                         trail_active = True
                         trail_stop = float(entry)
-                    
+                elif is_high_wr_strategy(strategy):
+                    # HIGH_WR runner: trailing activates once TP1 filled (SL at BE,
+                    # set by maybe_move_high_wr_sl_to_be), then ratchets at
+                    # trail_atr_mult x ATR behind the peak.
+                    trail_mult = float((CONFIG.get('high_wr_scalp', {}) or {}).get('trail_atr_mult', 3.0))
+                    if sl_moved and not trail_active:
+                        logger.info(f"🚀 {sym} HIGH_WR TP1 filled. Activating Chandelier Trail ({trail_mult:.0f} ATR)...")
+                        cur.execute("UPDATE active_trades SET trailing_active = 1, trailing_stop_price = ? WHERE id = ?", (float(entry), t_id))
+                        trail_active = True
+                        trail_stop = float(entry)
+
                 # Trailing Logic Execution
-                    if strategy == 'NORMAL' and trail_active:
-                        atr_buffer = float(natr_val if natr_val else (mark * 0.02)) * 2 # 2x ATR buffer or 4% default
-                        if side_str == 'Long':
-                            new_trail = mark - atr_buffer
-                            if not trail_stop or new_trail > float(trail_stop):
-                                if update_stop_loss_on_exchange(sym, side_str, size, new_trail):
-                                    cur.execute("""
-                                        UPDATE active_trades
-                                        SET trailing_stop_price = ?, sl_price = ?, last_sl_update_at = datetime('now'),
-                                            last_management_note = 'trailing_stop_update', updated_at = datetime('now')
-                                        WHERE id = ?
-                                    """, (new_trail, new_trail, t_id))
-                        else:
-                            new_trail = mark + atr_buffer
-                            if not trail_stop or new_trail < float(trail_stop):
-                                if update_stop_loss_on_exchange(sym, side_str, size, new_trail):
-                                    cur.execute("""
-                                        UPDATE active_trades
-                                        SET trailing_stop_price = ?, sl_price = ?, last_sl_update_at = datetime('now'),
-                                            last_management_note = 'trailing_stop_update', updated_at = datetime('now')
-                                        WHERE id = ?
-                                    """, (new_trail, new_trail, t_id))
+                if trail_active:
+                    atr_buffer = float(natr_val if natr_val else (mark * 0.02)) * trail_mult
+                    if side_str == 'Long':
+                        new_trail = mark - atr_buffer
+                        if not trail_stop or new_trail > float(trail_stop):
+                            if update_stop_loss_on_exchange(sym, side_str, size, new_trail):
+                                cur.execute("""
+                                    UPDATE active_trades
+                                    SET trailing_stop_price = ?, sl_price = ?, last_sl_update_at = datetime('now'),
+                                        last_management_note = 'trailing_stop_update', updated_at = datetime('now')
+                                    WHERE id = ?
+                                """, (new_trail, new_trail, t_id))
+                    else:
+                        new_trail = mark + atr_buffer
+                        if not trail_stop or new_trail < float(trail_stop):
+                            if update_stop_loss_on_exchange(sym, side_str, size, new_trail):
+                                cur.execute("""
+                                    UPDATE active_trades
+                                    SET trailing_stop_price = ?, sl_price = ?, last_sl_update_at = datetime('now'),
+                                        last_management_note = 'trailing_stop_update', updated_at = datetime('now')
+                                    WHERE id = ?
+                                """, (new_trail, new_trail, t_id))
             except Exception as e:
                 logger.error(f"CCXT poll position error for {sym}: {e}")
             
@@ -642,7 +770,7 @@ def ingest_fresh_signals():
         markets = exchange.load_markets()
 
         query = """
-            SELECT t.id, t.symbol, t.side, t.entry_price, t.sl_price, t.tp1, t.tp2, t.tp3, t.natr, t.timeframe
+            SELECT t.id, t.symbol, t.side, t.entry_price, t.sl_price, t.tp1, t.tp2, t.tp3, t.natr, t.timeframe, t.pattern
             FROM trades t
             LEFT JOIN active_trades a ON t.id = a.signal_id
             WHERE t.status = 'Waiting Entry'
@@ -654,13 +782,15 @@ def ingest_fresh_signals():
         
         for sig in signals:
             if current_active >= MAX_POSITIONS: break
-            sig_id, sym, side, entry, sl, tp1, tp2, tp3, natr, tf = sig
+            sig_id, sym, side, entry, sl, tp1, tp2, tp3, natr, tf, pattern = sig
             entry, sl = float(entry), float(sl)
 
             # --- Strategy Routing ---
             strategy = 'NORMAL'
             grid_max = 1
-            if tf in ['15m', '1h']:
+            if is_high_wr_signal(pattern, tf):
+                strategy = 'HIGH_WR_SCALP'
+            elif tf in ['15m', '1h']:
                 strategy = 'SCALPING'
                 s_cfg = CONFIG.get('scalping_setup', {'tp_percentage': 1.5, 'sl_percentage': 1.0})
                 tp_pct = s_cfg['tp_percentage'] / 100
@@ -757,6 +887,39 @@ def execute_scalping_trade(exchange, oid, sym, side, entry, sl, tp1_val, qty, le
     finally: release_conn(conn)
     return False
 
+def execute_high_wr_trade(exchange, oid, sym, side, entry, sl, qty, lev):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        try: exchange.set_leverage(int(lev), sym)
+        except: pass
+
+        ticker = exchange.fetch_ticker(sym)
+        current_price = float(ticker['last'])
+
+        is_better_price = (side == 'Long' and current_price <= entry) or (side == 'Short' and current_price >= entry)
+        type_side = 'buy' if side == 'Long' else 'sell'
+
+        qty_str = exchange.amount_to_precision(sym, qty)
+        params = {'stopLoss': float(sl)}
+
+        if is_better_price:
+            res = exchange.create_order(sym, 'market', type_side, qty_str, None, params)
+        else:
+            res = exchange.create_order(sym, 'limit', type_side, qty_str, entry, params)
+
+        if res and 'id' in res:
+            cur.execute("UPDATE active_trades SET order_id = ?, status = 'OPEN', updated_at = datetime('now') WHERE id = ?", (res['id'], oid))
+            conn.commit()
+            logger.info(f"✅ HIGH_WR order placed for {sym} without full-size TP")
+            return True
+    except Exception as e:
+        logger.error(f"❌ HIGH_WR execution failed {sym}: {e}")
+        cur.execute("UPDATE active_trades SET status = 'FAILED' WHERE id = ?", (oid,))
+        conn.commit()
+    finally: release_conn(conn)
+    return False
+
 def execute_grid_trade(exchange, oid, sym, side, entry, sl, tp1_val, qty, lev, grid_max):
     conn = get_conn()
     try:
@@ -819,14 +982,16 @@ def execute_pending_orders():
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, symbol, side, entry_price, sl_price, tp1, quantity, leverage, strategy, grid_max_layers FROM active_trades WHERE status = 'PENDING'")
+        cur.execute("SELECT id, symbol, side, entry_price, sl_price, tp1, tp2, tp3, quantity, leverage, strategy, grid_max_layers FROM active_trades WHERE status = 'PENDING'")
         orders = cur.fetchall()
         if not orders: return 
 
         for order in orders:
-            oid, sym, side, entry, sl, tp1_val, qty, lev, strategy, grid_max = order
+            oid, sym, side, entry, sl, tp1_val, tp2_val, tp3_val, qty, lev, strategy, grid_max = order
             
-            if strategy == 'SCALPING':
+            if is_high_wr_strategy(strategy):
+                execute_high_wr_trade(exchange, oid, sym, side, entry, sl, qty, lev)
+            elif strategy == 'SCALPING':
                 execute_scalping_trade(exchange, oid, sym, side, entry, sl, tp1_val, qty, lev)
             elif strategy == 'GRID':
                 execute_grid_trade(exchange, oid, sym, side, entry, sl, tp1_val, qty, lev, grid_max)

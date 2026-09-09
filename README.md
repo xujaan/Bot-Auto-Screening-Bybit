@@ -1,6 +1,6 @@
 # Futurabot (Multi-CEX)
 
-An institutional-grade, modular cryptocurrency trading bot previously designed for Bybit and now expanded to support **Binance, Bitget, and Bybit**. This bot leverages a hybrid analysis engine combining geometric pattern recognition, Smart Money Concepts (SMC), quantitative metrics (RVOL, OBI, VPIN), and derivative market data (CVD, Open Interest, Funding Rates) to identify high-probability setups.
+An institutional-grade, modular cryptocurrency trading bot previously designed for Bybit and now expanded to support **Binance, Bitget, and Bybit**. This bot leverages a hybrid analysis engine combining geometric pattern recognition, Smart Money Concepts (SMC), quantitative metrics (RVOL, OBI, VPIN), and derivative market data (CVD, Open Interest, Funding Rates) to identify high-probability setups. A dedicated **HIGH_WR_SCALP** engine additionally serves manual 15m/30m scalping with breakout-retest setups, layered 30m/4h confirmation, and order-book awareness.
 
 It features a robust production architecture with a lightweight **SQLite** persistence layer, dynamic CCXT API execution, Telegram bot control hub, and a local Web Dashboard.
 
@@ -18,6 +18,18 @@ It features a robust production architecture with a lightweight **SQLite** persi
   - **Regime Detection:** Uses ADX alongside SMA-50/200 hierarchy to classify the environment into Trending Bull, Trending Bear, or Volatile Expansion.
   - **Volatility Squeeze:** Implements TTM Squeeze logic (Bollinger Bands nested inside Keltner Channels) to reward breakout setups that are about to detonate.
 - **Divergence Logic:** Scans for divergences on Stochastic RSI and CVD (Cumulative Volume Delta).
+
+### 🎯 HIGH_WR_SCALP Signal Engine (15m / 30m)
+
+A dedicated manual-scalp engine that produces high win-rate setups with layered confirmation:
+
+- **Layered Trend Confirmation:** signals on `15m`/`30m` are validated against a `30m` trend confirmation (EMA 13/21, SMA 50/200, ADX, ATR-extension limit) and a `4h` macro filter that either hard-rejects counter-trend signals or applies a score penalty on neutral macro regimes (`macro_confirmation_mode`).
+- **Breakout-Retest Priority:** the preferred setup detects a fresh volume-confirmed breakout of a swing level (RVOL ≥ 1.55, body ≥ 0.55 ATR, strong close position), then enters on the retest of that level within an ATR-bounded distance — refusing over-chased entries beyond the chase limit.
+- **Trend Pullback Fallback:** when no breakout is present, a selected trend-pullback setup is allowed only with a strong 30m trend regime, sufficient RVOL/ADX momentum, MACD alignment, and a clean pullback-reclaim trigger candle.
+- **Order Book Integration:** live depth snapshots are scored via **OBI** (bid/ask notional imbalance) and **wall detection**; opposing walls penalize the score and shift the entry zone away, while a clean book + strong RVOL upgrades the signal to a **High Probability** tier.
+- **RR-Optimized Runner Exits:** entries are an ATR-based zone and SL sits at swing ± ATR, but exits follow the validated RR 1:5 structure instead of a pure win-rate ladder: **20% of the position closes at TP1 = 1R**, the stop moves to **breakeven after TP1**, and the remaining **80% runner is trailed with a Chandelier stop `3x ATR` behind the peak** (config: `tp1_r`, `use_trailing_runner`, `trail_atr_mult`) — mirrored exactly in `auto_trades.py` (poll + websocket paths).
+- **Diagnostics:** every rejection reason is tallied per scan (with example symbols) and reported so filters can be tuned empirically instead of guessed.
+- **Offline Validation:** `scripts/backtest_high_wr_scalp.py` replays the same logic on public OHLCV (or CSV) — including fees, slippage, and the breakeven rule — before the strategy is used live.
 
 ### 🛡️ Risk Management & Multi-CEX Auto Trade
 
@@ -42,17 +54,20 @@ It features a robust production architecture with a lightweight **SQLite** persi
 
 ```text
 /
-├── auto_trades.py          # Auto Execution & Background Target Tracker
+├── auto_trades.py          # Auto Execution, Adaptive Trade Management & Target Tracker
 ├── futurabot.sqlite        # SQLite Native Database File (Generated automatically)
 ├── config.json             # Core Configuration (Telegram Token & API Nodes)
 ├── dashboard.py            # Local Streamlit Analytics Server
 ├── main.py                 # Algorithmic Signal Scanner (Crons)
+├── scripts/
+│   └── backtest_high_wr_scalp.py  # Offline HIGH_WR_SCALP backtest on public OHLCV
 └── modules/
     ├── bot.py              # Telegram Formatter & Charting logic
     ├── config_loader.py    # Reads config.json safely
     ├── database.py         # SQLite connection manager & DB State
     ├── exchange_manager.py # CCXT Multi-CEX Dynamic Instance Loader
     ├── execution.py        # Generic Limit/Market Trade executors
+    ├── high_wr_scalp.py    # HIGH_WR_SCALP signal engine (breakout-retest, 30m/4h confirmation, order book)
     ├── telegram_listener.py# Handles Telegram Commands (Poller)
     └── (Analytical Engines): patterns.py, technicals.py, quant.py, smc.py, derivatives.py
 ```
@@ -138,11 +153,13 @@ streamlit run dashboard.py
 
 ### Trade Lifecycle
 
-1.  **Scan:** `main.py` fetches top perps for the currently active exchange (`CCXT`).
+1.  **Scan:** `main.py` fetches top perps for the currently active exchange (`CCXT`). On `15m`/`30m` it runs the HIGH_WR_SCALP engine instead of the classical pipeline.
 2.  **Filter & Score:** Passes technical criteria (SMC, Z-Score, Divergence). Evaluates minimum risk to reward constraint.
 3.  **Signal Integration:** Bot inserts logic to SQLite and fires an image-annotated Telegram post.
 4.  **Auto Trading:** If `/autotrade on` is toggled in Telegram, `auto_trades.py` grabs the signal. It parses the configured max ceiling array (`/setcapital` and `/setquota`), then calculates contract bounds dynamically.
 5.  **Lifecycle TPs:** For Bybit, it listens using lightning fast WebSockets. For Binance/Bitget, it spins a local 10s-polling loop replicating CCXT boundaries. TPs trigger instantly.
+
+> **Manual HIGH_WR_SCALP path:** on `15m`/`30m` the scanner bypasses the classical pattern/SMC scoring and uses `modules/high_wr_scalp.py` instead (see the HIGH_WR_SCALP section above). Signals are posted to Telegram for manual execution and do not require `auto_trades.py`; if `/autotrade on` is enabled they still flow through the same execution pipeline — placing only the 20% TP1 limit order and letting the 80% runner ride with the Chandelier trailing stop.
 
 ---
 

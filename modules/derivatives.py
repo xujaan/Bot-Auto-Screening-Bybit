@@ -1,9 +1,22 @@
 import numpy as np
 from scipy.stats import linregress
 
+from modules.config_loader import CONFIG
+
 def get_slope(series):
     try: return linregress(np.arange(len(series)), np.array(series))[0]
     except: return 0
+
+def _funding_thresholds():
+    """
+    Funding rate scale: normal perp funding is ~0.0001 (0.01%), hot is
+    ~0.001 (0.1%). Thresholds live in config under 'derivatives'.
+    """
+    cfg = CONFIG.get("derivatives", {}) or {}
+    return {
+        "reject": float(cfg.get("funding_reject_threshold", 0.001)),
+        "cool": float(cfg.get("funding_cool_threshold", 0.0008)),
+    }
 
 def analyze_derivatives(df, ticker, side):
     """
@@ -11,17 +24,18 @@ def analyze_derivatives(df, ticker, side):
     """
     score = 1
     reasons = []
+    th = _funding_thresholds()
     
     # 1. Funding Rate Check
     funding = float(ticker.get('info', {}).get('fundingRate', 0))
-    if side == "Long" and funding > 0.02: 
-        return False, 0, ["Funding Hot (>0.02%)"]
-    if side == "Short" and funding < -0.02:
-        return False, 0, ["Funding Squeeze Risk (<-0.02%)"]
+    if side == "Long" and funding > th["reject"]:
+        return False, 0, [f"Funding Hot ({funding * 100:.3f}% > {th['reject'] * 100:.2f}%)"]
+    if side == "Short" and funding < -th["reject"]:
+        return False, 0, [f"Funding Squeeze Risk ({funding * 100:.3f}% < -{th['reject'] * 100:.2f}%)"]
     
-    if abs(funding) < 0.01: 
+    if abs(funding) < th["cool"]:
         score += 1
-        reasons.append("Cool Funding")
+        reasons.append(f"Cool Funding ({funding * 100:.3f}%)")
 
     # 2. Basis Calculation
     mark = float(ticker.get('last', 0))

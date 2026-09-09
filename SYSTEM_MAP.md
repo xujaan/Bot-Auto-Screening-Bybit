@@ -9,9 +9,9 @@
   - **Web Dashboard:** Streamlit
   - **Integrasi Eksternal:** Murni Telegram Bot API (Berbahasa Inggris)
 - **Pola Arsitektur:** Implementasi sistem terpisah (Decoupled & Event-driven):
-  1. _Scanner & Analyzer_ berjalan dengan interval Cron di `main.py`. Base CCXT menyesuaikan `active_cex`. Mode manual `HIGH_WR_SCALP` aktif di timeframe kecil untuk entry-zone, partial TP, dan BE rule.
+  1. _Scanner & Analyzer_ berjalan dengan interval Cron di `main.py`. Base CCXT menyesuaikan `active_cex`. Mode manual `HIGH_WR_SCALP` aktif di timeframe 15m/30m untuk breakout-retest, entry-zone, partial TP, dan BE rule.
   2. _Live Executor / Rest Polling Engine_ berjalan terus menerus di `auto_trades.py` dengan fallback websocket parsial pada instansiasi tertentu, ditambah algoritma ATR Position Sizing dan ATR Dynamic Trailing Stop.
-  3. Modul _Analyzer_ dipecah layer-by-layer (Technicals, Quant, SMC, Pattern). Melibatkan _Multi-Timeframe Confluence_ untuk filter market regime makro.
+  3. Modul _Analyzer_ dipecah layer-by-layer (Technicals, Quant, SMC, Pattern, High-WR Scalp). Melibatkan _Multi-Timeframe Confluence_ untuk filter market regime makro (30m/4h untuk jalur HIGH_WR_SCALP).
 
 # Core Logic Flow (Function-Level Flowchart)
 
@@ -19,7 +19,7 @@
 `main.py[scan]` (Load Active CEX) -> `main.py[analyze_ticker]` -> `modules.technicals[get_technicals]` -> `modules.patterns[find_pattern]` -> `modules.smc[analyze_smc]` -> `modules.quant[calculate_metrics]` -> `modules.derivative[analyze_derivatives]` -> `modules.bot[send_alert]`(Telegram Only) -> `modules.execution[execute_entry]` (Opsional jika auto_trade menyala via Telegram).
 
 **High-WR Manual Scalp Path:**
-`main.py[analyze_ticker]` -> `modules.high_wr_scalp[analyze_high_wr_scalp]` -> `modules.bot[send_alert]` dengan entry zone, 6 partial TP, dan instruksi move SL to breakeven after TP2. Jalur ini dirancang untuk manual trade; tidak membutuhkan `auto_trades.py`.
+`main.py[analyze_ticker]` -> fetch 30m confirmation + 4h macro + order book -> `modules.high_wr_scalp[analyze_high_wr_scalp]` -> `modules.bot[send_alert]` dengan setup prioritas `BREAKOUT_RETEST`, fallback `TREND_PULLBACK` hanya bila 30m benar-benar trending dan RVOL/ADX cukup kuat, filter makro 4h (mode `penalty`/`hard`), analisa order book (OBI, wall detection, penyesuaian entry, tier `High Probability`), entry zone ATR, TP1 20% @ 1R, instruksi move SL to breakeven after TP1, dan 80% runner ditrail Chandelier 3 ATR. Alasan penolakan dicatat via diagnostics dan dirangkum per timeframe untuk tuning. Jalur ini dirancang untuk manual trade; tidak membutuhkan `auto_trades.py`.
 
 **2. Alur Eksekusi Trading & Real-Time Engine:**
 
@@ -28,6 +28,7 @@
 - _Live Monitoring & TP/SL Automation:_
   - (Binance/Bitget CEX): `auto_trades.py[ccxt_poll_positions]` CCXT Polling Loop merotasi data position dari REST, menaruh Chandelier Trailing Stop, dan limit Take Profit secara algoritmik.
   - (Bybit): Dipertahankan mengkonsumsi callback Websocket real-time melalui utilitas engine di `sync_active_exchange()`.
+- _Adaptive Trade Management:_ `auto_trades.py[run_adaptive_trade_management]` mengevaluasi tiap posisi terbuka berbasis `origin_timeframe` — menghitung `progress_ratio`, melacak `peak_price`, menaikkan ladder profit-lock (SL dirapatkan bertahap: Level 1/2/3), mendeteksi rejection/momentum loss/stagnation, lalu merapatkan SL, mendekatkan TP, partial close, atau early exit. Keputusan tiap aksi dicatat di `last_management_note` dan DB.
 - Telegram Switcher: Telegram `/cex` Command -> set DB `active_cex` -> Polling Engine auto re-initiation CCXT.
 
 # Clean Tree
@@ -86,19 +87,20 @@
   - **Peran:** Jembatan eksekusi trading generik untuk CCXT terstandardisasi.
 - **`modules/high_wr_scalp.py`**
   - **Fungsi Utama:** `analyze_high_wr_scalp()`
-  - **Peran:** Generator sinyal manual high win-rate berbasis trend pullback, entry zone ATR, partial targets, dan BE after TP2.
+  - **Peran:** Generator sinyal manual high win-rate berlapis: 30m trend confirmation, 4h macro confirmation (mode `penalty`/`hard`), setup prioritas `BREAKOUT_RETEST` lalu fallback `TREND_PULLBACK`, analisa order book (OBI, wall detection, penyesuaian entry, tier `High Probability`), entry zone ATR, TP1 20% @ 1R + BE after TP1, 80% runner ditrail Chandelier 3 ATR, plus pencatatan alasan rejection (diagnostics) untuk tuning.
 - **`modules/bot.py`**
   - **Fungsi Utama:** `send_alert()`
   - **Peran:** Formatter notifikasi ke Telegram (Termasuk gambar signal chart dan parameter Quant).
 - _(Algorithmic Models)_: `technicals.py`, `patterns.py`, `smc.py`, `quant.py`, `derivatives.py` tetap mensuplai raw metric data (OB/RSI/RVOL/Funding dll) ke matrix scoring.
 - **`scripts/backtest_high_wr_scalp.py`**
-  - **Fungsi Utama:** Fetch OHLCV publik CCXT atau baca CSV, lalu simulasi entry zone, partial TP, fee/slippage, dan BE rule.
-  - **Peran:** Validasi offline sebelum mode manual dipakai live.
+  - **Fungsi Utama:** Fetch OHLCV publik CCXT (bybit/binance/bitget) atau baca CSV, resample ke 30m/4h untuk confirmation, lalu simulasi entry zone, partial TP, fee/slippage, BE rule, dan trailing Chandelier (`trail_atr_mult`); output ringkasan performa (win-rate, profit factor, max drawdown) per symbol + ekspor CSV.
+  - **Peran:** Validasi offline setup HIGH_WR_SCALP sebelum mode manual dipakai live.
 
 # Data & Config
 
 - **Lokasi Config:** File konfigurasi berbasis JSON tertulis di `config.json` mendukung Multi-CEX key arraying (`api -> bybit/binance/bitget`).
-- **High-WR Config:** `high_wr_scalp` mengatur timeframe `15m`, minimum RVOL/ADX/NATR, entry-zone ATR, SL ATR, target multipliers, split partial close, dan BE trigger.
+- **High-WR Config:** `high_wr_scalp` mengatur timeframe `15m`/`30m`, 30m confirmation, 4h macro confirmation (`macro_confirmation_mode` `penalty`/`hard`), minimum RVOL/ADX/NATR, setup `BREAKOUT_RETEST` (lookback, buffer, chase limit) & `TREND_PULLBACK`, order book (OBI threshold, wall ratio, penyesuaian entry, tier `High Probability`), entry-zone ATR, SL ATR, skor minimum (`min_score`), dan exit model runner: TP1 berbasis risk (`tp1_r` = 1R) untuk `tp_splits[0]` (20%), BE after TP1, sisanya 80% runner ditrail Chandelier `trail_atr_mult` (3 ATR) — `use_trailing_runner` untuk kembali ke model multi-TP lama; plus allow/blocked symbols. Filter regime BTC opsional (`btc_bias_filter` `none`/`soft`/`hard` + `btc_bias_timeframe`) — default `none` karena walk-forward 365 hari menunjukkan filter ini memangkas trade loss di window chop tapi juga menghancurkan edge di window tren (lihat hasil uji).
+- **Adaptive Management Config:** `adaptive_management` mengatur evaluasi posisi berkala (progress ratio, ladder profit-lock 3 level, deteksi rejection/stagnation, partial close & early exit) berbasis timeframe asal trade (`origin_timeframe`).
 - **Skema Data Inti:** Ada 3 tabel utama:
   1. `trades`: Tabel pool sinyal hasil scanner algoritmis (symbol, pattern, exit levels).
   2. `active_trades`: Tabel turunan eksekusi real-time per order ID yang aktif (margin, status open/closed). Relasi: `active_trades.signal_id -> trades.id`.
@@ -114,3 +116,4 @@
 
 - _Polling Delay:_ CCXT Polling `auto_trades.py` diset pada interval pendek namun dapat *slip* (1-2 detik) saat pergerakan flash-crash karena koneksi REST, oleh karena itu *trailing stops* diset mengikuti ATR untuk menyerap *slip* tersebut sebelum Stop Loss tersentuh berlebihan.
 - _API Key Boundaries:_ Konfigurasi API `secret` dari CEX lain disatukan di text config.json tanpa enkripsi hardware lokal.
+- _Order Book Dependency:_ jalur HIGH_WR_SCALP memakai snapshot order book (OBI/wall) untuk scoring entry; snapshot bisa cepat basi saat volatilitas tinggi, sehingga keputusan entry tetap diberi buffer ATR dan filter jarak entry.

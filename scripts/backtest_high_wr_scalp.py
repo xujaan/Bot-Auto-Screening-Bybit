@@ -252,9 +252,20 @@ def simulate_trade(
     move_be_after = int(cfg.get("move_sl_to_be_after_tp", 2))
     max_idx = min(len(raw_df), entry_idx + 1 + max_hold_bars)
 
+    # Chandelier trailing: once activated (after trail_start_after_tp partial TPs
+    # have hit), the stop ratchets to peak_price -/+ trail_atr_mult * ATR and only
+    # ever tightens. trail_atr_mult <= 0 disables trailing entirely.
+    trail_mult = float(cfg.get("trail_atr_mult", 0.0))
+    trail_start_after = int(cfg.get("trail_start_after_tp", 1))
+    atr = float(signal.get("ATR", 0.0))
+    trailing = trail_mult > 0 and atr > 0
+    trailing_active = False
+    peak = entry
+
     for idx in range(entry_idx + 1, max_idx):
         row = raw_df.iloc[idx]
 
+        # 1) Stop check (trailing stop reflects extremes up to the PRIOR bar)
         if stop_touched(row, stop):
             pnl_pct += remaining * net_return(entry, stop, side, fee_rate, slippage_pct) * 100
             remaining = 0.0
@@ -263,6 +274,7 @@ def simulate_trade(
             exit_idx = idx
             break
 
+        # 2) Partial TP fills
         while tp_hits < len(tps) and tp_touched(row, tps[tp_hits]):
             close_ratio = min(splits[tp_hits], remaining)
             pnl_pct += close_ratio * net_return(entry, tps[tp_hits], side, fee_rate, slippage_pct) * 100
@@ -277,6 +289,18 @@ def simulate_trade(
                 break
         if remaining <= 1e-9:
             break
+
+        # 3) Ratchet the trailing stop from this bar's extreme (next bar onwards)
+        if trailing and not trailing_active and tp_hits >= trail_start_after:
+            trailing_active = True
+            peak = entry
+        if trailing and trailing_active:
+            if side == "Long":
+                peak = max(peak, float(row["high"]))
+                stop = max(stop, peak - trail_mult * atr)
+            else:
+                peak = min(peak, float(row["low"]))
+                stop = min(stop, peak + trail_mult * atr)
     else:
         exit_idx = max_idx - 1
         close = float(raw_df.iloc[exit_idx]["close"])
@@ -315,6 +339,107 @@ def prepare_technical_df(df: pd.DataFrame) -> pd.DataFrame:
     return get_technicals(df.copy()).reset_index(drop=True)
 
 
+def build_confirmation_df(df: pd.DataFrame, timeframe: str, cfg: Dict) -> Optional[pd.DataFrame]:
+    confirmation_tf = str(cfg.get("confirmation_timeframe", "30m"))
+    if not cfg.get("require_30m_confirmation", True):
+        return None
+    if timeframe == confirmation_tf:
+        return None
+    if timeframe != "15m" or confirmation_tf != "30m":
+        return None
+
+    frame = df.copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    frame = frame.set_index("timestamp")
+    resampled = frame.resample("30min").agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+    )
+    resampled = resampled.dropna().reset_index()
+    if len(resampled) < 80:
+        return None
+    return prepare_technical_df(resampled)
+
+
+def build_macro_df(df: pd.DataFrame, timeframe: str, cfg: Dict) -> Optional[pd.DataFrame]:
+    macro_tf = str(cfg.get("macro_timeframe", "4h"))
+    if not cfg.get("require_4h_confirmation", True):
+        return None
+    if timeframe == macro_tf:
+        return None
+    if timeframe not in ["15m", "30m"] or macro_tf != "4h":
+        return None
+
+    frame = df.copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    frame = frame.set_index("timestamp")
+    resampled = frame.resample("4h").agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+    )
+    resampled = resampled.dropna().reset_index()
+    if len(resampled) < 80:
+        return None
+    return prepare_technical_df(resampled)
+
+
+def build_btc_bias_series(btc_df: Optional[pd.DataFrame], cfg: Dict) -> Optional[pd.DataFrame]:
+    """EMA13/EMA21 bias of BTC on cfg['btc_bias_timeframe'] (default '4h').
+
+    Returns df[timestamp, bias] aligned to that timeframe, where bias is
+    'Bullish' or 'Bearish' per bar. Mirrors main.py get_btc_bias() (which uses
+    1d EMA13/EMA21 on live data).
+    """
+    if btc_df is None or btc_df.empty:
+        return None
+    bias_tf = str(cfg.get("btc_bias_timeframe", "4h")).lower()
+    frame = btc_df.copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    frame = frame.set_index("timestamp")
+    if bias_tf == "1d":
+        frame = frame.resample("1D").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna()
+    elif bias_tf == "4h":
+        frame = frame.resample("4h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna()
+    else:
+        return None
+    if len(frame) < 30:
+        return None
+    ema13 = frame["close"].ewm(span=13, adjust=False).mean()
+    ema21 = frame["close"].ewm(span=21, adjust=False).mean()
+    valid = ema13.notna() & ema21.notna()
+    frame = frame[valid]
+    if len(frame) < 2:
+        return None
+    bias_ser = pd.Series("Bearish", index=frame.index)
+    bias_ser[ema13[valid] > ema21[valid]] = "Bullish"
+    return pd.DataFrame({"timestamp": frame.index, "bias": bias_ser}).reset_index(drop=True)
+
+
+def lookup_btc_bias(series: Optional[pd.DataFrame], signal_ts) -> Optional[str]:
+    """Most recent BTC bias at or before signal_ts (no lookahead)."""
+    if series is None or series.empty:
+        return None
+    ts = pd.Timestamp(signal_ts)
+    pos = series["timestamp"].searchsorted(ts, side="right") - 1
+    if pos < 0:
+        return None
+    return str(series.iloc[pos]["bias"])
+
+
 def nearest_position_by_time(df: pd.DataFrame, timestamp) -> int:
     ts = pd.Timestamp(timestamp)
     matches = df.index[df["timestamp"] == ts]
@@ -336,9 +461,14 @@ def backtest_symbol(
     entry_fill: str,
     start_idx: Optional[int] = None,
     end_idx: Optional[int] = None,
+    exit_transform: Optional[callable] = None,
+    btc_df: Optional[pd.DataFrame] = None,
 ) -> List[TradeResult]:
     results: List[TradeResult] = []
     tech_df = prepare_technical_df(df)
+    confirmation_df = build_confirmation_df(df, timeframe, cfg)
+    macro_df = build_macro_df(df, timeframe, cfg)
+    btc_bias_series = build_btc_bias_series(btc_df, cfg)
     if len(tech_df) < 240:
         return results
 
@@ -370,10 +500,35 @@ def backtest_symbol(
             continue
 
         ticker = {"last": float(last["close"]), "info": {"fundingRate": "0"}}
-        signal = analyze_high_wr_scalp(tech, ticker, symbol, timeframe, cfg)
+        confirm_slice = None
+        if confirmation_df is not None:
+            confirm_pos = nearest_position_by_time(confirmation_df, signal_ts)
+            confirm_slice = confirmation_df.iloc[: confirm_pos + 1]
+        macro_slice = None
+        if macro_df is not None:
+            macro_pos = nearest_position_by_time(macro_df, signal_ts)
+            macro_slice = macro_df.iloc[: macro_pos + 1]
+        signal = analyze_high_wr_scalp(
+            tech,
+            ticker,
+            symbol,
+            timeframe,
+            cfg,
+            confirmation_df=confirm_slice,
+            macro_df=macro_slice,
+            btc_bias=lookup_btc_bias(btc_bias_series, signal_ts),
+        )
         if not signal:
             tech_i += 1
             continue
+
+        # Optional post-processing of the exit ladder (e.g. RR 1:5 runner)
+        # while keeping signal generation identical.
+        if exit_transform:
+            signal = exit_transform(signal, cfg)
+            if not signal:
+                tech_i += 1
+                continue
 
         trade = simulate_trade(
             df,
@@ -540,6 +695,8 @@ def run_backtest_set(
     entry_fill: str,
     ranges: Optional[Dict[str, tuple[Optional[int], Optional[int]]]] = None,
     progress_label: Optional[str] = None,
+    exit_transform: Optional[callable] = None,
+    btc_df: Optional[pd.DataFrame] = None,
 ) -> List[TradeResult]:
     all_results: List[TradeResult] = []
     total = len(datasets)
@@ -560,6 +717,8 @@ def run_backtest_set(
                 entry_fill,
                 start_idx,
                 end_idx,
+                exit_transform,
+                btc_df,
             )
         )
     return all_results

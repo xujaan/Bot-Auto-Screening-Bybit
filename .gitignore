@@ -21,3 +21,4 @@ venv
 *.db
 
 skills-lock.json
+AGENTS.md

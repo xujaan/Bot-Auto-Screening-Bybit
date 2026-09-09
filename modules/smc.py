@@ -2,9 +2,38 @@ import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
 
+def _dedupe_plateau_extrema(values, extrema):
+    """
+    Collapse consecutive equal-price pivot runs (plateaus) into a single pivot.
+
+    With np.less_equal / np.greater_equal every bar of a flat run is flagged
+    as an extremum. Those duplicates misread structure: a flat support at the
+    current price makes last_l == second-to-last low, which get_market_structure
+    classifies as 'LL' (invalid) instead of a genuine higher-low/support.
+    """
+    if len(extrema) < 2:
+        return extrema
+    kept = [int(extrema[0])]
+    prev = kept[0]
+    for raw_pos in extrema[1:]:
+        pos = int(raw_pos)
+        # Adjacent flagged bars belong to the same plateau (equal price).
+        if pos == prev + 1 and values[pos] == values[prev]:
+            prev = pos
+            continue
+        kept.append(pos)
+        prev = pos
+    return np.array(kept)
+
 def find_pivots(df, order=5):
-    df['min_local'] = df.iloc[argrelextrema(df.low.values, np.less_equal, order=order)[0]]['low']
-    df['max_local'] = df.iloc[argrelextrema(df.high.values, np.greater_equal, order=order)[0]]['high']
+    low_ext = _dedupe_plateau_extrema(
+        df.low.values, argrelextrema(df.low.values, np.less_equal, order=order)[0]
+    )
+    high_ext = _dedupe_plateau_extrema(
+        df.high.values, argrelextrema(df.high.values, np.greater_equal, order=order)[0]
+    )
+    df['min_local'] = df.iloc[low_ext]['low']
+    df['max_local'] = df.iloc[high_ext]['high']
     highs = df[df['max_local'].notna()][['max_local']].rename(columns={'max_local': 'price'})
     lows = df[df['min_local'].notna()][['min_local']].rename(columns={'min_local': 'price'})
     return highs, lows

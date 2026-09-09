@@ -124,6 +124,8 @@ def send_telegram_alert(data, image_path=None):
     text += f"• RVOL: `{rvol:.1f}x` ({rvol_txt})\n"
     text += f"• Z-Score: `{data.get('Z_Score', 0):.2f}σ`\n"
     text += f"• OBI: `{data.get('OBI', 0.0):.2f}`\n"
+    if is_high_wr:
+        text += f"• Quality: `{data.get('Quality_Tier', 'Standard')}`\n"
     text += f"• Funding: `{fund_pct:.4f}%`\n\n"
     
     total_score = data.get('Tech_Score', 0) + data.get('SMC_Score', 0) + data.get('Quant_Score', 0) + data.get('Deriv_Score', 0)
@@ -170,6 +172,8 @@ def send_telegram_alert(data, image_path=None):
     # 3. Final Verdict
     if abs(fund_pct) > 0.15 or data.get('OBI', 0) < -0.9 or status.startswith("🔴"):
         verdict = "❌ (High Risk / Avoid)"
+    elif is_high_wr and data.get('Quality_Tier') == 'High Probability' and entry_dist <= 0.5:
+        verdict = "⭐⭐⭐ (High Probability)"
     elif total_score >= 16 and z_score < 2.0 and abs(fund_pct) < 0.05 and entry_dist <= 0.5:
         verdict = "⭐⭐⭐ (High Quality)"
 
