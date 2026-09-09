@@ -79,6 +79,34 @@ def make_rr_transform(tp1_r=1.0, tp1_split=0.20, runner_r=None):
     return transform
 
 
+def make_multi_tp_transform(tp_r_list, split_list, move_be_after=2):
+    """Multi-partial exit ladder with risk-multiple targets. The remainder after
+    the listed splits is left for the Chandelier trail (trail_start_after_tp
+    must be set to len(tp_r_list) in the variant config)."""
+    def transform(signal, cfg):
+        side = signal["Side"]
+        entry = float(signal["Entry"])
+        sl = float(signal["SL"])
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None
+
+        def tp_at(r):
+            return entry + r * risk if side == "Long" else entry - r * risk
+
+        plan = [
+            {"price": tp_at(r), "close_ratio": float(s)}
+            for r, s in zip(tp_r_list, split_list)
+        ]
+        signal["TP1"] = plan[0]["price"]
+        signal["TP2"] = plan[1]["price"] if len(plan) > 1 else plan[-1]["price"]
+        signal["TP3"] = plan[-1]["price"]
+        signal["TP_Plan"] = plan
+        signal["Move_SL_To_BE_After_TP"] = move_be_after
+        return signal
+    return transform
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--exchange", default="bybit", choices=["bybit", "binance", "bitget"])
@@ -87,7 +115,10 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--max-hold-bars", type=int, default=32)
     parser.add_argument("--entry-wait-bars", type=int, default=8)
-    parser.add_argument("--fee-rate", type=float, default=0.0006)
+    parser.add_argument("--fee-rate", type=float, default=0.0006,
+                        help="taker fee rate (stop-loss / market exits)")
+    parser.add_argument("--maker-fee-rate", type=float, default=0.0002,
+                        help="maker fee rate (limit entries & take-profit fills)")
     parser.add_argument("--slippage-pct", type=float, default=0.0003)
     parser.add_argument("--entry-fill", default="ideal", choices=["ideal", "aggressive", "conservative"])
     parser.add_argument("--variants", default="configured_default,rr5_runner,rr5_trail_2atr,rr5_trail_3atr",
@@ -95,11 +126,52 @@ def main() -> int:
     parser.add_argument("--walk-forward", action="store_true",
                         help="split each symbol into train/test windows and report both")
     parser.add_argument("--train-ratio", type=float, default=0.6)
+    parser.add_argument("--loose-entry", action="store_true",
+                        help="loosen entry gates (min_score 6, shorts on, no SMA200/momentum "
+                             "requirement) to generate a larger trade sample; only the exit "
+                             "ladder is varied between variants")
+    parser.add_argument("--loose-entry-v2", action="store_true",
+                        help="much looser gates (min_score 4, shorts on, no SMA200/momentum/4h "
+                             "requirement, wider extension limits) to generate a large sample")
     args = parser.parse_args()
 
     base_cfg = get_high_wr_config(CONFIG.get("high_wr_scalp", {}))
     base_cfg["enabled"] = True
     base_cfg["timeframes"] = [args.timeframe]
+    if args.loose_entry:
+        base_cfg.update({
+            "min_score": 6,
+            "allow_longs": True,
+            "allow_shorts": True,
+            "require_sma200_alignment": False,
+            "require_momentum_turn": False,
+            "macro_confirmation_mode": "penalty",
+            "btc_bias_filter": "none",
+            "min_rvol": 1.15,
+            "min_adx": 15.0,
+            "min_natr": 0.20,
+            "max_natr": 10.0,
+            "min_breakout_score": 6,
+            "trend_pullback_min_score": 6,
+        })
+    if args.loose_entry_v2:
+        base_cfg.update({
+            "min_score": 4,
+            "allow_longs": True,
+            "allow_shorts": True,
+            "require_sma200_alignment": False,
+            "require_momentum_turn": False,
+            "require_4h_confirmation": False,
+            "macro_confirmation_mode": "penalty",
+            "btc_bias_filter": "none",
+            "min_rvol": 1.15,
+            "min_adx": 15.0,
+            "min_natr": 0.20,
+            "max_natr": 10.0,
+            "max_extension_atr": 2.5,
+            "min_breakout_score": 4,
+            "trend_pullback_min_score": 4,
+        })
 
     all_variants = {
         "configured_default": (dict(base_cfg), None, "new default: 20% @1R, 80% runner Chandelier trail 3 ATR"),
@@ -109,6 +181,20 @@ def main() -> int:
         "rr5_trail_2atr": ({**base_cfg, **RR5_OVERRIDES, "trail_atr_mult": 2.0, "trail_start_after_tp": 1},
                            make_rr_transform(1.0, 0.20, runner_r=None),
                            "20% @1R, 80% Chandelier trail 2.0 ATR"),
+        "trail_2atr_tp40": ({**base_cfg, **RR5_OVERRIDES, "trail_atr_mult": 2.0, "trail_start_after_tp": 1, "tp_splits": [0.40, 0.60]},
+                            make_rr_transform(1.0, 0.40, runner_r=None),
+                            "40% @1R, 60% Chandelier trail 2.0 ATR"),
+        "trail_15atr_tp40": ({**base_cfg, **RR5_OVERRIDES, "trail_atr_mult": 1.5, "trail_start_after_tp": 1, "tp_splits": [0.40, 0.60]},
+                             make_rr_transform(1.0, 0.40, runner_r=None),
+                             "40% @1R, 60% Chandelier trail 1.5 ATR"),
+        "two_tp_trail_2atr": ({**base_cfg, **RR5_OVERRIDES, "trail_atr_mult": 2.0, "trail_start_after_tp": 2,
+                               "move_sl_to_be_after_tp": 2, "tp_splits": [0.30, 0.30, 0.40]},
+                              make_multi_tp_transform([1.0, 2.0], [0.30, 0.30], move_be_after=2),
+                              "30% @1R + 30% @2R, BE after TP2, 40% trail 2.0 ATR"),
+        "three_tp_hard": ({**base_cfg, "use_trailing_runner": False, "trail_atr_mult": 0.0,
+                           "move_sl_to_be_after_tp": 1, "tp_splits": [0.40, 0.30, 0.30]},
+                          make_multi_tp_transform([1.0, 2.0, 3.0], [0.40, 0.30, 0.30], move_be_after=1),
+                          "no runner: 40% @1R, 30% @2R, 30% @3R hard targets"),
         "rr5_trail_3atr": ({**base_cfg, **RR5_OVERRIDES, "trail_atr_mult": 3.0, "trail_start_after_tp": 1},
                            make_rr_transform(1.0, 0.20, runner_r=None),
                            "20% @1R, 80% Chandelier trail 3.0 ATR, hold 32"),
@@ -193,6 +279,7 @@ def main() -> int:
                     datasets, args.timeframe, cfg, hold, args.entry_wait_bars,
                     args.fee_rate, args.slippage_pct, args.entry_fill,
                     ranges=ranges, exit_transform=transform, btc_df=btc_df,
+                    maker_fee=args.maker_fee_rate,
                 )
                 s = summarize(results)
                 by_label[label] = (s, results)
@@ -218,6 +305,7 @@ def main() -> int:
             datasets, args.timeframe, cfg, hold, args.entry_wait_bars,
             args.fee_rate, args.slippage_pct, args.entry_fill,
             exit_transform=transform, btc_df=btc_df,
+            maker_fee=args.maker_fee_rate,
         )
         summaries[name] = summarize(results)
         all_results[name] = results

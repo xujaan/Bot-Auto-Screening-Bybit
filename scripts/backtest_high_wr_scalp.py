@@ -184,12 +184,46 @@ def load_csv(path: str) -> pd.DataFrame:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-def net_return(entry: float, exit_price: float, side: str, fee_rate: float, slippage_pct: float) -> float:
+def net_return(
+    entry: float,
+    exit_price: float,
+    side: str,
+    maker_fee: float,
+    taker_fee: float,
+    slippage_pct: float,
+    exit_type: str = "limit",
+) -> float:
+    """Net return for one closed leg, mirroring live order structure.
+
+    Entries are placed as limit orders (maker fee, no slippage), take-profit
+    exits are limit orders (maker fee), while stop-loss / time exits are market
+    orders (taker fee + slippage).
+    """
     if side == "Long":
         gross = (exit_price - entry) / entry
     else:
         gross = (entry - exit_price) / entry
-    return gross - (fee_rate * 2) - (slippage_pct * 2)
+    entry_fee = maker_fee
+    if exit_type == "market":
+        exit_fee = taker_fee
+        slippage = slippage_pct
+    else:
+        exit_fee = maker_fee
+        slippage = 0.0
+    return gross - entry_fee - exit_fee - slippage
+
+
+def _atr_series(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """Wilder ATR over the whole frame (used for a dynamic trailing buffer,
+    mirroring live behavior where the trail uses NATR% x current price)."""
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / length, adjust=False).mean()
 
 
 def simulate_trade(
@@ -199,7 +233,8 @@ def simulate_trade(
     cfg: Dict,
     max_hold_bars: int,
     entry_wait_bars: int,
-    fee_rate: float,
+    maker_fee: float,
+    taker_fee: float,
     slippage_pct: float,
     entry_fill: str,
 ) -> Optional[TradeResult]:
@@ -255,9 +290,13 @@ def simulate_trade(
     # Chandelier trailing: once activated (after trail_start_after_tp partial TPs
     # have hit), the stop ratchets to peak_price -/+ trail_atr_mult * ATR and only
     # ever tightens. trail_atr_mult <= 0 disables trailing entirely.
+    # The ATR buffer is DYNAMIC (Wilder ATR of the current bar, recomputed per
+    # bar), mirroring live behavior where the trail uses NATR% x current price
+    # instead of the ATR captured at signal time.
     trail_mult = float(cfg.get("trail_atr_mult", 0.0))
     trail_start_after = int(cfg.get("trail_start_after_tp", 1))
     atr = float(signal.get("ATR", 0.0))
+    atr_series = _atr_series(raw_df)
     trailing = trail_mult > 0 and atr > 0
     trailing_active = False
     peak = entry
@@ -267,7 +306,7 @@ def simulate_trade(
 
         # 1) Stop check (trailing stop reflects extremes up to the PRIOR bar)
         if stop_touched(row, stop):
-            pnl_pct += remaining * net_return(entry, stop, side, fee_rate, slippage_pct) * 100
+            pnl_pct += remaining * net_return(entry, stop, side, maker_fee, taker_fee, slippage_pct, "market") * 100
             remaining = 0.0
             exit_price = stop
             outcome = "SL" if tp_hits < move_be_after else "BE_OR_TRAIL"
@@ -277,7 +316,7 @@ def simulate_trade(
         # 2) Partial TP fills
         while tp_hits < len(tps) and tp_touched(row, tps[tp_hits]):
             close_ratio = min(splits[tp_hits], remaining)
-            pnl_pct += close_ratio * net_return(entry, tps[tp_hits], side, fee_rate, slippage_pct) * 100
+            pnl_pct += close_ratio * net_return(entry, tps[tp_hits], side, maker_fee, taker_fee, slippage_pct, "limit") * 100
             remaining -= close_ratio
             exit_price = tps[tp_hits]
             tp_hits += 1
@@ -291,20 +330,21 @@ def simulate_trade(
             break
 
         # 3) Ratchet the trailing stop from this bar's extreme (next bar onwards)
+        bar_atr = float(atr_series.iloc[idx]) if atr_series.iloc[idx] > 0 else atr
         if trailing and not trailing_active and tp_hits >= trail_start_after:
             trailing_active = True
             peak = entry
         if trailing and trailing_active:
             if side == "Long":
                 peak = max(peak, float(row["high"]))
-                stop = max(stop, peak - trail_mult * atr)
+                stop = max(stop, peak - trail_mult * bar_atr)
             else:
                 peak = min(peak, float(row["low"]))
-                stop = min(stop, peak + trail_mult * atr)
+                stop = min(stop, peak + trail_mult * bar_atr)
     else:
         exit_idx = max_idx - 1
         close = float(raw_df.iloc[exit_idx]["close"])
-        pnl_pct += remaining * net_return(entry, close, side, fee_rate, slippage_pct) * 100
+        pnl_pct += remaining * net_return(entry, close, side, maker_fee, taker_fee, slippage_pct, "market") * 100
         exit_price = close
 
     if outcome == "TIME_EXIT":
@@ -463,6 +503,7 @@ def backtest_symbol(
     end_idx: Optional[int] = None,
     exit_transform: Optional[callable] = None,
     btc_df: Optional[pd.DataFrame] = None,
+    maker_fee: Optional[float] = None,
 ) -> List[TradeResult]:
     results: List[TradeResult] = []
     tech_df = prepare_technical_df(df)
@@ -537,6 +578,7 @@ def backtest_symbol(
             cfg,
             max_hold_bars,
             entry_wait_bars,
+            maker_fee if maker_fee is not None else fee_rate,
             fee_rate,
             slippage_pct,
             entry_fill,
@@ -697,6 +739,7 @@ def run_backtest_set(
     progress_label: Optional[str] = None,
     exit_transform: Optional[callable] = None,
     btc_df: Optional[pd.DataFrame] = None,
+    maker_fee: Optional[float] = None,
 ) -> List[TradeResult]:
     all_results: List[TradeResult] = []
     total = len(datasets)
@@ -719,6 +762,7 @@ def run_backtest_set(
                 end_idx,
                 exit_transform,
                 btc_df,
+                maker_fee,
             )
         )
     return all_results
@@ -932,6 +976,7 @@ def run_screen_then_test(
     timeframe: str,
     cfg: Dict,
     args,
+    maker_fee: Optional[float] = None,
 ) -> tuple[str, Dict, Dict, List[TradeResult]]:
     train_ranges, test_ranges = build_walk_forward_ranges(datasets, args.train_ratio)
     presets = optimization_presets(cfg) if args.optimize else [("configured", cfg)]
@@ -960,6 +1005,7 @@ def run_screen_then_test(
             args.entry_fill,
             train_ranges,
             f"{name} train",
+            maker_fee=maker_fee,
         )
         diagnostics = screen_symbol_diagnostics(train_results, args)
         active_diagnostics = diagnostics if args.screen_slices > 1 else None
@@ -987,6 +1033,7 @@ def run_screen_then_test(
             args.entry_fill,
             test_ranges,
             f"{name} test",
+            maker_fee=maker_fee,
         )
         train_summary = summarize([row for row in train_results if row.symbol in selected_set])
         test_summary = summarize(test_results)
@@ -1077,7 +1124,10 @@ def main() -> int:
     parser.add_argument("--csv-symbol", default="CSV/USDT:USDT")
     parser.add_argument("--max-hold-bars", type=int, default=32)
     parser.add_argument("--entry-wait-bars", type=int, default=8)
-    parser.add_argument("--fee-rate", type=float, default=0.0006)
+    parser.add_argument("--fee-rate", type=float, default=0.0006,
+                        help="taker fee rate (stop-loss / market exits)")
+    parser.add_argument("--maker-fee-rate", type=float, default=0.0002,
+                        help="maker fee rate (limit entries & take-profit fills)")
     parser.add_argument("--slippage-pct", type=float, default=0.0003)
     parser.add_argument("--entry-fill", choices=["ideal", "aggressive", "conservative"], default="ideal")
     parser.add_argument("--optimize", action="store_true")
@@ -1096,9 +1146,15 @@ def main() -> int:
     parser.add_argument("--best-preset-by", choices=["train", "holdout"], default="holdout")
     parser.add_argument("--screen-report")
     parser.add_argument("--output")
+    parser.add_argument("--config-override", default="",
+                        help="JSON dict merged over the high_wr_scalp config, e.g. "
+                             "'{\"min_score\": 4, \"allow_shorts\": true}'") 
     args = parser.parse_args()
 
     cfg = get_high_wr_config(CONFIG.get("high_wr_scalp", {}))
+    if args.config_override:
+        import json as _json
+        cfg.update(_json.loads(args.config_override))
     cfg["enabled"] = True
     cfg["timeframes"] = [args.timeframe]
 
@@ -1131,7 +1187,9 @@ def main() -> int:
             datasets.append((symbol, df))
 
     if args.screen_then_test:
-        _, _, summary, all_results = run_screen_then_test(datasets, args.timeframe, cfg, args)
+        _, _, summary, all_results = run_screen_then_test(
+            datasets, args.timeframe, cfg, args, maker_fee=args.maker_fee_rate
+        )
     elif args.optimize:
         scored = []
         print("Optimization presets")
@@ -1145,6 +1203,7 @@ def main() -> int:
                 args.fee_rate,
                 args.slippage_pct,
                 args.entry_fill,
+                maker_fee=args.maker_fee_rate,
             )
             summary = summarize(results)
             scored.append((name, test_cfg, summary, results))
@@ -1179,6 +1238,7 @@ def main() -> int:
             args.fee_rate,
             args.slippage_pct,
             args.entry_fill,
+            maker_fee=args.maker_fee_rate,
         )
 
     summary = summarize(all_results)

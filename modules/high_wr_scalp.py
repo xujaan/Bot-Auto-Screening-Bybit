@@ -87,6 +87,11 @@ DEFAULT_CONFIG = {
     "max_against_wall_ratio": 1.8,
     "wall_adjust_entry_atr": 0.20,
     "order_book_penalty": 2,
+    # Empty list = no session filter. Otherwise only signals whose signal bar
+    # falls in one of these UTC hours are accepted (e.g. [18, 19, 20, 21, 22, 23]
+    # for the UTC evening session). Backtest analysis on 245 trades showed the
+    # UTC 18-24 session has the best win rate / profit factor.
+    "session_hours": [],
 }
 
 
@@ -861,6 +866,17 @@ def analyze_high_wr_scalp(
     if df is None or len(df) < 80:
         _record_rejection(diagnostics, "not_enough_candles", symbol, str(len(df) if df is not None else 0))
         return None
+
+    session_hours = cfg.get("session_hours") or []
+    if session_hours:
+        allowed = set(int(h) for h in session_hours)
+        try:
+            hour = int(pd.Timestamp(df["timestamp"].iloc[-1]).hour)
+        except Exception:
+            hour = -1
+        if hour not in allowed:
+            _record_rejection(diagnostics, "session_hour", symbol, f"UTC {hour}")
+            return None
 
     rvol = _rvol(df)
     adx = _last(df, "ADX_14")
